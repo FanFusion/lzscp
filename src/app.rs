@@ -119,10 +119,10 @@ impl App {
     }
 
     pub fn tick(&mut self) {
-        if let Some((_, at)) = &self.toast {
-            if at.elapsed() > std::time::Duration::from_secs(4) {
-                self.toast = None;
-            }
+        if let Some((_, at)) = &self.toast
+            && at.elapsed() > std::time::Duration::from_secs(4)
+        {
+            self.toast = None;
         }
     }
 
@@ -344,10 +344,7 @@ impl App {
                 }
             }
             TransferEvent::Line { .. } => {}
-            TransferEvent::Completed {
-                id,
-                remote_abs_dir,
-            } => {
+            TransferEvent::Completed { id, remote_abs_dir } => {
                 let (local, target_name) = match self.transfer_mut(id) {
                     Some(t) => {
                         t.state = TransferState::Completed;
@@ -407,16 +404,13 @@ impl App {
 }
 
 fn trunc(s: &str, max: usize) -> String {
-    let mut it = s.chars();
     let mut out = String::new();
-    let mut count = 0;
-    for c in it.by_ref() {
+    for (count, c) in s.chars().enumerate() {
         if count >= max {
             out.push('…');
             return out;
         }
         out.push(c);
-        count += 1;
     }
     out
 }

@@ -61,6 +61,7 @@ impl Config {
         self.groups.iter().find(|g| g.name == name)
     }
 
+    #[allow(dead_code)]
     pub fn default_target(&self) -> Option<&Target> {
         self.default_target
             .as_ref()
@@ -73,15 +74,15 @@ pub fn load() -> Result<Config> {
     let project = project_config_path();
     let global = global_config_path();
 
-    if let Some(p) = project {
-        if p.exists() {
-            return parse_from(&p, true);
-        }
+    if let Some(p) = project
+        && p.exists()
+    {
+        return parse_from(&p, true);
     }
-    if let Some(p) = global {
-        if p.exists() {
-            return parse_from(&p, false);
-        }
+    if let Some(p) = global
+        && p.exists()
+    {
+        return parse_from(&p, false);
     }
     Ok(Config::default())
 }
@@ -89,8 +90,8 @@ pub fn load() -> Result<Config> {
 pub fn parse_from(path: &Path, is_project: bool) -> Result<Config> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading config at {}", path.display()))?;
-    let mut cfg: Config = toml::from_str(&raw)
-        .with_context(|| format!("parsing config at {}", path.display()))?;
+    let mut cfg: Config =
+        toml::from_str(&raw).with_context(|| format!("parsing config at {}", path.display()))?;
     cfg.source = if is_project {
         ConfigSource::Project(path.to_path_buf())
     } else {

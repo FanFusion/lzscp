@@ -77,9 +77,7 @@ fn normalize_single(raw: &str) -> String {
     if let Some(rest) = s.strip_prefix("file://") {
         // drop leading host component if present — usually empty for file://
         let (_host, path) = split_file_uri_host(rest);
-        s = percent_decode_str(path)
-            .decode_utf8_lossy()
-            .to_string();
+        s = percent_decode_str(path).decode_utf8_lossy().to_string();
     }
 
     // Manual unescape for backslash-escaped spaces and backslashes (for inputs
@@ -87,9 +85,7 @@ fn normalize_single(raw: &str) -> String {
     s = unescape_backslash(&s);
 
     // ~ and $HOME expansion.
-    s = shellexpand::full(&s)
-        .map(|v| v.into_owned())
-        .unwrap_or(s);
+    s = shellexpand::full(&s).map(|v| v.into_owned()).unwrap_or(s);
 
     s
 }
@@ -108,18 +104,18 @@ fn unescape_backslash(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\\' {
-            if let Some(&next) = chars.peek() {
-                // `\ ` → ` `, `\\` → `\`, `\"` → `"`, `\'` → `'`, `\t` → tab
-                match next {
-                    ' ' | '\\' | '"' | '\'' | '(' | ')' | '&' | ';' | '$' | '`' => {
-                        out.push(next);
-                        chars.next();
-                        continue;
-                    }
-                    _ => {
-                        // keep backslash + next as-is (e.g. Windows paths `C:\Users\x`)
-                    }
+        if c == '\\'
+            && let Some(&next) = chars.peek()
+        {
+            // `\ ` → ` `, `\\` → `\`, `\"` → `"`, `\'` → `'`, `\t` → tab
+            match next {
+                ' ' | '\\' | '"' | '\'' | '(' | ')' | '&' | ';' | '$' | '`' => {
+                    out.push(next);
+                    chars.next();
+                    continue;
+                }
+                _ => {
+                    // keep backslash + next as-is (e.g. Windows paths `C:\Users\x`)
                 }
             }
         }
@@ -169,10 +165,7 @@ mod tests {
 
     #[test]
     fn chinese_with_space_escaped() {
-        assert_eq!(
-            parse_paste("/tmp/截图\\ 1.png"),
-            vec!["/tmp/截图 1.png"]
-        );
+        assert_eq!(parse_paste("/tmp/截图\\ 1.png"), vec!["/tmp/截图 1.png"]);
     }
 
     #[test]

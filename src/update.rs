@@ -6,7 +6,7 @@ const VERSION_URL: &str = "https://raw.githubusercontent.com/FanFusion/lzscp/mai
 /// same-or-older.
 pub async fn check_for_updates() -> Result<Option<String>> {
     let current = crate::VERSION.to_string();
-    let latest = tokio::task::spawn_blocking(|| fetch_latest())
+    let latest = tokio::task::spawn_blocking(fetch_latest)
         .await
         .context("join error")??;
     if is_newer(&latest, &current) {

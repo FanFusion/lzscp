@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use crate::target::Target;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Several fields are reserved for UI features in later versions.
 pub enum TransferEvent {
     Started {
         id: u64,
@@ -37,6 +38,7 @@ pub enum TransferEvent {
 }
 
 pub struct Transfer {
+    #[allow(dead_code)]
     pub id: u64,
     pub target_name: String,
     pub local: PathBuf,
@@ -142,10 +144,7 @@ async fn run(
     let _ = stderr_task.await;
 
     if status.success() {
-        let _ = tx.send(TransferEvent::Completed {
-            id,
-            remote_abs_dir,
-        });
+        let _ = tx.send(TransferEvent::Completed { id, remote_abs_dir });
         Ok(())
     } else {
         let code = status.code().unwrap_or(-1);
@@ -157,11 +156,8 @@ async fn run(
     }
 }
 
-async fn read_progress_stream<R>(
-    id: u64,
-    stdout: R,
-    tx: mpsc::UnboundedSender<TransferEvent>,
-) where
+async fn read_progress_stream<R>(id: u64, stdout: R, tx: mpsc::UnboundedSender<TransferEvent>)
+where
     R: tokio::io::AsyncRead + Unpin,
 {
     // rsync --info=progress2 uses \r to overwrite its progress line. Read
@@ -289,6 +285,7 @@ async fn resolve_remote_home(target: &Target) -> Result<String> {
 }
 
 /// Ping one target: verify rsync + ssh connectivity. Used for UI status.
+#[allow(dead_code)] // Wired up in a follow-up patch; kept here for 0.1.0.
 pub async fn preflight(target: &Target) -> Result<()> {
     // Ensure rsync exists locally.
     let which = Command::new("sh")
@@ -331,8 +328,7 @@ mod tests {
 
     #[test]
     fn parse_progress_basic() {
-        let p = parse_progress_line("     1,234,567  45%   12.34MB/s    0:00:03")
-            .expect("parses");
+        let p = parse_progress_line("     1,234,567  45%   12.34MB/s    0:00:03").expect("parses");
         assert_eq!(p.bytes, 1_234_567);
         assert_eq!(p.percent, 45);
         assert_eq!(p.rate, "12.34MB/s");

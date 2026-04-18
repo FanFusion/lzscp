@@ -23,35 +23,26 @@ pub struct Group {
     pub primary: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ClipboardFormat {
+    #[default]
     RemotePath,
     ScpStyle,
     SshPath,
     Custom,
 }
 
-impl Default for ClipboardFormat {
-    fn default() -> Self {
-        Self::RemotePath
-    }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncMode {
+    #[default]
     Auto,
     Manual,
 }
 
-impl Default for SyncMode {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
-
 impl Target {
+    #[allow(dead_code)]
     pub fn user_str(&self) -> &str {
         self.user.as_deref().unwrap_or("")
     }

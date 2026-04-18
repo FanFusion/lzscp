@@ -35,7 +35,9 @@ pub fn render(
             Some(u) => format!("ssh://{}@{}{}", u, target.host, remote_path),
             None => format!("ssh://{}{}", target.host, remote_path),
         },
-        ClipboardFormat::Custom => render_template(custom_template, target, &remote_path, &basename),
+        ClipboardFormat::Custom => {
+            render_template(custom_template, target, &remote_path, &basename)
+        }
     }
 }
 
@@ -121,7 +123,10 @@ mod tests {
             ClipboardFormat::RemotePath,
             "{user}@{host}:{path}",
         );
-        assert_eq!(out, "ssh://ubuntu@dev.example.com/home/ubuntu/uploads/shot.png");
+        assert_eq!(
+            out,
+            "ssh://ubuntu@dev.example.com/home/ubuntu/uploads/shot.png"
+        );
     }
 
     #[test]

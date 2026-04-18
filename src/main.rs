@@ -12,11 +12,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, EventStream,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    EventStream,
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use futures::StreamExt;
 use ratatui::Terminal;
@@ -47,7 +48,7 @@ fn print_help() {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    for a in &args {
+    if let Some(a) = args.first() {
         match a.as_str() {
             "-V" | "--version" => {
                 println!("lzscp {VERSION}");

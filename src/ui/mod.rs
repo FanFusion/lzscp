@@ -17,12 +17,12 @@ pub fn draw(f: &mut Frame<'_>, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),     // title bar
-            Constraint::Length(7),     // drop zone
-            Constraint::Min(6),        // targets
-            Constraint::Length(8),     // progress
-            Constraint::Length(2),     // clipboard + toast
-            Constraint::Length(1),     // help
+            Constraint::Length(1), // title bar
+            Constraint::Length(7), // drop zone
+            Constraint::Min(6),    // targets
+            Constraint::Length(8), // progress
+            Constraint::Length(2), // clipboard + toast
+            Constraint::Length(1), // help
         ])
         .split(size);
 
@@ -44,7 +44,13 @@ fn draw_title(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
         SyncMode::Manual => "manual",
     };
     let title = Line::from(vec![
-        Span::styled(" lzscp ", Style::default().bg(p.accent).fg(p.bg).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " lzscp ",
+            Style::default()
+                .bg(p.accent)
+                .fg(p.bg)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" "),
         Span::styled(format!("v{}", crate::VERSION), Style::default().fg(p.muted)),
         Span::raw("   "),
@@ -55,7 +61,10 @@ fn draw_title(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
             Style::default().fg(p.muted),
         ),
     ]);
-    f.render_widget(Paragraph::new(title).style(Style::default().fg(p.fg).bg(p.bg)), area);
+    f.render_widget(
+        Paragraph::new(title).style(Style::default().fg(p.fg).bg(p.bg)),
+        area,
+    );
 }
 
 fn draw_drop_zone(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
@@ -87,7 +96,10 @@ fn draw_drop_zone(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) 
                 Style::default().fg(p.diff_del),
             )),
         ];
-        f.render_widget(Paragraph::new(hint).block(block).wrap(Wrap { trim: false }), area);
+        f.render_widget(
+            Paragraph::new(hint).block(block).wrap(Wrap { trim: false }),
+            area,
+        );
         return;
     }
 
@@ -154,7 +166,10 @@ fn draw_targets(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
                 TargetKind::Group => " (group)",
             };
             let line = Line::from(vec![
-                Span::styled(format!(" {checkbox} "), Style::default().fg(if row.selected { p.accent } else { p.muted })),
+                Span::styled(
+                    format!(" {checkbox} "),
+                    Style::default().fg(if row.selected { p.accent } else { p.muted }),
+                ),
                 Span::styled(format!("{i}.  "), Style::default().fg(p.muted)),
                 Span::styled(format!("{}{tag}", row.name), style),
                 Span::raw("   "),
@@ -265,25 +280,43 @@ fn draw_status(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
 
 fn draw_help_bar(f: &mut Frame<'_>, area: Rect, _app: &App, p: &theme::Palette) {
     let help = Line::from(vec![
-        Span::styled(" Tab ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " Tab ",
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("focus  ", Style::default().fg(p.muted)),
-        Span::styled(" Space ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " Space ",
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("toggle  ", Style::default().fg(p.muted)),
-        Span::styled(" Enter ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " Enter ",
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("sync  ", Style::default().fg(p.muted)),
-        Span::styled(" a/m ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " a/m ",
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("auto/manual  ", Style::default().fg(p.muted)),
-        Span::styled(" c ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " c ",
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("clipboard-fmt  ", Style::default().fg(p.muted)),
-        Span::styled(" ? ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " ? ",
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("help  ", Style::default().fg(p.muted)),
-        Span::styled(" q ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " q ",
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("quit", Style::default().fg(p.muted)),
     ]);
-    f.render_widget(
-        Paragraph::new(help).style(Style::default().bg(p.bg)),
-        area,
-    );
+    f.render_widget(Paragraph::new(help).style(Style::default().bg(p.bg)), area);
 }
 
 fn draw_help_overlay(f: &mut Frame<'_>, area: Rect, p: &theme::Palette) {
