@@ -18,6 +18,14 @@ pub enum AppEvent {
     TransferUpdate(TransferEvent),
     UpdateCheckResult(std::result::Result<Option<String>, String>),
     UpdateInstallResult(std::result::Result<Vec<PathBuf>, String>),
+    PreflightResult {
+        target_name: String,
+        status: TargetStatus,
+    },
+    RemoteInstallResult {
+        target_name: String,
+        result: std::result::Result<(), String>,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -55,6 +63,8 @@ pub enum HelpBarAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
     CheckUpdate,
+    ReprobeTargets,
+    InstallRsyncOnSelected,
     ToggleMode,
     CycleClipboardFormat,
     CycleTheme,
@@ -67,6 +77,8 @@ impl MenuAction {
     pub fn label(self) -> &'static str {
         match self {
             MenuAction::CheckUpdate => "Check for update",
+            MenuAction::ReprobeTargets => "Re-probe all targets",
+            MenuAction::InstallRsyncOnSelected => "Install rsync on selected target",
             MenuAction::ToggleMode => "Toggle auto / manual mode",
             MenuAction::CycleClipboardFormat => "Cycle clipboard format",
             MenuAction::CycleTheme => "Cycle theme",
@@ -79,6 +91,8 @@ impl MenuAction {
     pub fn shortcut(self) -> &'static str {
         match self {
             MenuAction::CheckUpdate => "u",
+            MenuAction::ReprobeTargets => "r",
+            MenuAction::InstallRsyncOnSelected => "i",
             MenuAction::ToggleMode => "a/m",
             MenuAction::CycleClipboardFormat => "c",
             MenuAction::CycleTheme => "t",
@@ -91,6 +105,8 @@ impl MenuAction {
     pub fn all() -> &'static [MenuAction] {
         &[
             MenuAction::CheckUpdate,
+            MenuAction::ReprobeTargets,
+            MenuAction::InstallRsyncOnSelected,
             MenuAction::ToggleMode,
             MenuAction::CycleClipboardFormat,
             MenuAction::CycleTheme,
@@ -131,12 +147,23 @@ pub enum TargetKind {
     Group,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum TargetStatus {
+    #[default]
+    Unknown,
+    Probing,
+    Reachable,
+    NoRsync,
+    Unreachable(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct TargetRow {
     pub name: String,
     pub kind: TargetKind,
     pub summary: String,
     pub selected: bool,
+    pub status: TargetStatus,
 }
 
 pub struct App {
@@ -182,6 +209,7 @@ impl App {
                 kind: TargetKind::Single,
                 summary: t.display_endpoint(),
                 selected: false,
+                status: TargetStatus::Unknown,
             })
             .collect();
         for g in &cfg.groups {
@@ -190,6 +218,7 @@ impl App {
                 kind: TargetKind::Group,
                 summary: format!("group → {}", g.targets.join(" + ")),
                 selected: false,
+                status: TargetStatus::Unknown,
             });
         }
 
@@ -252,6 +281,103 @@ impl App {
             AppEvent::TransferUpdate(u) => self.handle_transfer_event(u),
             AppEvent::UpdateCheckResult(r) => self.handle_update_check_result(r),
             AppEvent::UpdateInstallResult(r) => self.handle_update_install_result(r),
+            AppEvent::PreflightResult {
+                target_name,
+                status,
+            } => self.apply_preflight_result(&target_name, status),
+            AppEvent::RemoteInstallResult {
+                target_name,
+                result,
+            } => self.apply_remote_install_result(&target_name, result),
+        }
+    }
+
+    pub fn spawn_preflight_all(&mut self) {
+        for row in &mut self.target_rows {
+            if row.kind == TargetKind::Group {
+                continue;
+            }
+            row.status = TargetStatus::Probing;
+        }
+        for target in self.cfg.targets.clone() {
+            let tx = self.app_tx.clone();
+            let name = target.name.clone();
+            tokio::spawn(async move {
+                let status = match crate::transfer::preflight_full(&target).await {
+                    Ok(_) => TargetStatus::Reachable,
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        if msg.contains("rsync not found on remote") {
+                            TargetStatus::NoRsync
+                        } else {
+                            TargetStatus::Unreachable(msg)
+                        }
+                    }
+                };
+                let _ = tx.send(AppEvent::PreflightResult {
+                    target_name: name,
+                    status,
+                });
+            });
+        }
+    }
+
+    fn apply_preflight_result(&mut self, name: &str, status: TargetStatus) {
+        if let Some(row) = self.target_rows.iter_mut().find(|r| r.name == name) {
+            row.status = status;
+        }
+    }
+
+    pub fn start_remote_rsync_install(&mut self, target_name: &str) {
+        let Some(target) = self.cfg.target_by_name(target_name).cloned() else {
+            return;
+        };
+        if let Some(row) = self.target_rows.iter_mut().find(|r| r.name == target_name) {
+            row.status = TargetStatus::Probing;
+        }
+        self.toast(&format!("installing rsync on {target_name}…"));
+        let tx = self.app_tx.clone();
+        let name = target_name.to_string();
+        tokio::spawn(async move {
+            let result = crate::transfer::remote_install_rsync(&target)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(AppEvent::RemoteInstallResult {
+                target_name: name,
+                result,
+            });
+        });
+    }
+
+    fn apply_remote_install_result(&mut self, name: &str, result: std::result::Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.toast(&format!("installed rsync on {name}"));
+                // Re-probe that target.
+                if let Some(target) = self.cfg.target_by_name(name).cloned() {
+                    if let Some(row) = self.target_rows.iter_mut().find(|r| r.name == name) {
+                        row.status = TargetStatus::Probing;
+                    }
+                    let tx = self.app_tx.clone();
+                    let tname = name.to_string();
+                    tokio::spawn(async move {
+                        let status = match crate::transfer::preflight_full(&target).await {
+                            Ok(_) => TargetStatus::Reachable,
+                            Err(e) => TargetStatus::Unreachable(format!("{e:#}")),
+                        };
+                        let _ = tx.send(AppEvent::PreflightResult {
+                            target_name: tname,
+                            status,
+                        });
+                    });
+                }
+            }
+            Err(e) => {
+                if let Some(row) = self.target_rows.iter_mut().find(|r| r.name == name) {
+                    row.status = TargetStatus::NoRsync;
+                }
+                self.toast(&format!("install failed: {e}"));
+            }
         }
     }
 
@@ -324,10 +450,20 @@ impl App {
             }
         }
 
-        // Target row click → focus targets + toggle that row.
+        // Target row click → focus targets + toggle that row. If the target
+        // is in NoRsync state, clicking triggers the auto-install flow
+        // instead of toggling selection.
         for (i, r) in self.hit_regions.target_rows.clone().iter().enumerate() {
             if rect_contains(*r, x, y) {
                 self.focus = Focus::Targets;
+                if let Some(row) = self.target_rows.get(i)
+                    && row.status == TargetStatus::NoRsync
+                {
+                    let name = row.name.clone();
+                    self.target_cursor = i;
+                    self.start_remote_rsync_install(&name);
+                    return;
+                }
                 if i < self.target_rows.len() {
                     self.target_cursor = i;
                     self.toggle_target_cursor();
@@ -512,6 +648,20 @@ impl App {
     fn run_menu_action(&mut self, a: MenuAction) {
         match a {
             MenuAction::CheckUpdate => self.start_update_check(),
+            MenuAction::ReprobeTargets => {
+                self.spawn_preflight_all();
+                self.toast("re-probing targets…");
+            }
+            MenuAction::InstallRsyncOnSelected => {
+                if let Some(row) = self.target_rows.get(self.target_cursor) {
+                    if row.kind == TargetKind::Single {
+                        let name = row.name.clone();
+                        self.start_remote_rsync_install(&name);
+                    } else {
+                        self.toast("select a single target first");
+                    }
+                }
+            }
             MenuAction::ToggleMode => {
                 self.mode = match self.mode {
                     SyncMode::Auto => SyncMode::Manual,

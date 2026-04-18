@@ -2,6 +2,7 @@ mod app;
 mod clipboard;
 mod config;
 mod path_input;
+mod ssh_config;
 mod target;
 mod transfer;
 mod ui;
@@ -111,6 +112,7 @@ async fn run_app(
     cfg: config::Config,
 ) -> Result<()> {
     let mut app = App::new(cfg);
+    app.spawn_preflight_all();
     let mut events = EventStream::new();
     let mut tick = interval(Duration::from_millis(100));
 

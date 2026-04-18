@@ -74,17 +74,62 @@ pub fn load() -> Result<Config> {
     let project = project_config_path();
     let global = global_config_path();
 
-    if let Some(p) = project
+    let mut cfg = if let Some(p) = project
         && p.exists()
     {
-        return parse_from(&p, true);
-    }
-    if let Some(p) = global
+        parse_from(&p, true)?
+    } else if let Some(p) = global
         && p.exists()
     {
-        return parse_from(&p, false);
+        parse_from(&p, false)?
+    } else {
+        Config::default()
+    };
+
+    // Merge hosts from ~/.ssh/config. Explicit TOML targets win on name
+    // collision (so a user can override the auto-detected default).
+    merge_ssh_config(&mut cfg);
+
+    // Pick a sensible default target if none set and we have any targets.
+    if cfg.default_target.is_none()
+        && let Some(first) = cfg.targets.first()
+    {
+        cfg.default_target = Some(first.name.clone());
     }
-    Ok(Config::default())
+    Ok(cfg)
+}
+
+fn merge_ssh_config(cfg: &mut Config) {
+    let existing_names: std::collections::HashSet<String> =
+        cfg.targets.iter().map(|t| t.name.clone()).collect();
+    for h in crate::ssh_config::load() {
+        if existing_names.contains(&h.name) {
+            continue;
+        }
+        // Skip SSH config blocks that clearly aren't login hosts (e.g. `Host
+        // github.com` present for key routing). We have no cheap signal here
+        // beyond the host pattern — let them through and let preflight decide.
+        cfg.targets.push(Target {
+            name: h.name,
+            host: h.hostname.unwrap_or_default(),
+            user: h.user,
+            remote_dir: "~/lzscp-inbox".to_string(),
+            ssh_port: h.port,
+            ssh_key: h.identity_file,
+            clipboard_format: None,
+        });
+    }
+}
+
+#[allow(dead_code)] // will be used by TUI edit flows in v0.2.0
+pub fn save_global(cfg: &Config) -> Result<PathBuf> {
+    let path = global_config_path().context("no global config dir")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {parent:?}"))?;
+    }
+    let text = toml::to_string_pretty(cfg).context("serialize config")?;
+    std::fs::write(&path, text).with_context(|| format!("write {path:?}"))?;
+    Ok(path)
 }
 
 pub fn parse_from(path: &Path, is_project: bool) -> Result<Config> {

@@ -322,6 +322,106 @@ pub async fn preflight(target: &Target) -> Result<()> {
     Ok(())
 }
 
+/// Full preflight: ssh reachable + remote has rsync. Returns Ok on success,
+/// Err with a message that the caller can pattern-match on
+/// ("rsync not found on remote") to offer auto-install.
+pub async fn preflight_full(target: &Target) -> Result<()> {
+    // Local rsync check
+    let local_ok = Command::new("sh")
+        .arg("-c")
+        .arg("command -v rsync >/dev/null 2>&1")
+        .status()
+        .await;
+    if !matches!(local_ok, Ok(s) if s.success()) {
+        anyhow::bail!("rsync not installed locally");
+    }
+
+    // Combined ssh probe: exit 0 means ssh works + rsync found. Exit 66 (arbitrary)
+    // means ssh works but rsync is missing.
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("BatchMode=yes");
+    cmd.arg("-o").arg("ConnectTimeout=6");
+    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    cmd.arg("-p").arg(target.ssh_port().to_string());
+    if let Some(key) = &target.ssh_key {
+        let expanded = shellexpand::tilde(key);
+        cmd.arg("-i").arg(expanded.as_ref());
+    }
+    let addr = match &target.user {
+        Some(u) => format!("{u}@{}", target.host),
+        None => target.host.clone(),
+    };
+    cmd.arg(addr)
+        .arg("if command -v rsync >/dev/null 2>&1; then exit 0; else exit 66; fi");
+    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+    let out = cmd.output().await.context("ssh preflight_full")?;
+    match out.status.code() {
+        Some(0) => Ok(()),
+        Some(66) => anyhow::bail!("rsync not found on remote"),
+        _ => {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            if err.is_empty() {
+                anyhow::bail!("ssh unreachable");
+            } else {
+                anyhow::bail!("ssh unreachable: {err}")
+            }
+        }
+    }
+}
+
+/// Install rsync on the remote host. Detects the package manager via
+/// /etc/os-release's ID field and runs the appropriate install command.
+/// Uses `sudo -n` (non-interactive) — if sudo needs a password, installation
+/// fails with a message suggesting manual install.
+pub async fn remote_install_rsync(target: &Target) -> Result<()> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("BatchMode=yes");
+    cmd.arg("-o").arg("ConnectTimeout=10");
+    cmd.arg("-p").arg(target.ssh_port().to_string());
+    if let Some(key) = &target.ssh_key {
+        let expanded = shellexpand::tilde(key);
+        cmd.arg("-i").arg(expanded.as_ref());
+    }
+    let addr = match &target.user {
+        Some(u) => format!("{u}@{}", target.host),
+        None => target.host.clone(),
+    };
+    cmd.arg(addr).arg(
+        // Shell script run on remote: pick the right package manager and install
+        // rsync, preferring passwordless sudo; fall back to plain (already root).
+        r#"set -e
+                if command -v rsync >/dev/null 2>&1; then
+                    exit 0
+                fi
+                sudo() { if [ "$(id -u)" = "0" ]; then "$@"; else command sudo -n "$@"; fi; }
+                if command -v apt-get >/dev/null 2>&1; then
+                    sudo apt-get update -qq && sudo apt-get install -y rsync
+                elif command -v dnf >/dev/null 2>&1; then
+                    sudo dnf install -y rsync
+                elif command -v yum >/dev/null 2>&1; then
+                    sudo yum install -y rsync
+                elif command -v apk >/dev/null 2>&1; then
+                    sudo apk add --no-cache rsync
+                elif command -v pacman >/dev/null 2>&1; then
+                    sudo pacman -Sy --noconfirm rsync
+                elif command -v zypper >/dev/null 2>&1; then
+                    sudo zypper install -y rsync
+                elif command -v brew >/dev/null 2>&1; then
+                    brew install rsync
+                else
+                    echo "no supported package manager found" >&2
+                    exit 1
+                fi
+                command -v rsync >/dev/null 2>&1"#,
+    );
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let out = cmd.output().await.context("ssh install")?;
+    if !out.status.success() {
+        anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

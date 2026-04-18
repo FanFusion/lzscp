@@ -6,7 +6,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap};
 
-use crate::app::{App, Focus, HelpBarAction, HitRegions, ModalHit, TargetKind, UpdateStatus};
+use crate::app::{
+    App, Focus, HelpBarAction, HitRegions, ModalHit, TargetKind, TargetStatus, UpdateStatus,
+};
 use crate::target::SyncMode;
 use crate::transfer::TransferState;
 
@@ -465,11 +467,11 @@ fn draw_targets(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette
         let p1 = Paragraph::new(vec![
             Line::from(""),
             Line::from(Span::styled(
-                "  No targets configured.",
+                "  No SSH hosts found.",
                 Style::default().fg(p.muted),
             )),
             Line::from(Span::styled(
-                "  Create .lzscp/config.toml or ~/.config/lzscp/config.toml",
+                "  Add entries to ~/.ssh/config (Host … HostName … User …)",
                 Style::default().fg(p.muted),
             )),
         ])
@@ -497,7 +499,7 @@ fn draw_targets(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette
         .iter()
         .enumerate()
         .map(|(i, row)| {
-            let checkbox = if row.selected { "[✓]" } else { "[ ]" };
+            let sel_glyph = if row.selected { "●" } else { "○" };
             let mut style = Style::default().fg(p.fg);
             if focused && i == app.target_cursor {
                 style = style.bg(p.selection).add_modifier(Modifier::BOLD);
@@ -506,15 +508,27 @@ fn draw_targets(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette
                 TargetKind::Single => "",
                 TargetKind::Group => " (group)",
             };
+            let (status_icon, status_style, status_tail) = status_display(&row.status, p);
+
             let line = Line::from(vec![
                 Span::styled(
-                    format!(" {checkbox} "),
-                    Style::default().fg(if row.selected { p.accent } else { p.muted }),
+                    format!(" {sel_glyph} "),
+                    Style::default()
+                        .fg(if row.selected { p.accent } else { p.muted })
+                        .add_modifier(if row.selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
                 ),
-                Span::styled(format!("{i}.  "), Style::default().fg(p.muted)),
+                Span::styled(status_icon, status_style),
+                Span::raw(" "),
+                Span::styled(format!("{i}. ", i = i + 1), Style::default().fg(p.muted)),
                 Span::styled(format!("{}{tag}", row.name), style),
-                Span::raw("   "),
+                Span::raw("  "),
                 Span::styled(row.summary.clone(), Style::default().fg(p.muted)),
+                Span::raw(" "),
+                Span::styled(status_tail, Style::default().fg(p.muted)),
             ]);
             ListItem::new(line)
         })
@@ -685,6 +699,40 @@ fn fs_size_pretty(p: &std::path::Path) -> String {
     } else {
         format!("{:.2} GB", bytes as f64 / (K * K * K) as f64)
     }
+}
+
+fn status_display(status: &TargetStatus, p: &theme::Palette) -> (String, Style, String) {
+    match status {
+        TargetStatus::Unknown => (
+            "[?]".to_string(),
+            Style::default().fg(p.muted),
+            String::new(),
+        ),
+        TargetStatus::Probing => (
+            "[…]".to_string(),
+            Style::default().fg(p.accent),
+            "probing".to_string(),
+        ),
+        TargetStatus::Reachable => (
+            "[✓]".to_string(),
+            Style::default().fg(p.diff_add),
+            String::new(),
+        ),
+        TargetStatus::NoRsync => (
+            "[⚠]".to_string(),
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            "no rsync — click to install".to_string(),
+        ),
+        TargetStatus::Unreachable(e) => (
+            "[✗]".to_string(),
+            Style::default().fg(p.diff_del),
+            first_line(e).to_string(),
+        ),
+    }
+}
+
+fn first_line(s: &str) -> &str {
+    s.lines().next().unwrap_or("")
 }
 
 fn truncate_middle(s: &str, max: usize) -> String {
