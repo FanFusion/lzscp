@@ -767,7 +767,14 @@ impl App {
 
         let target = crate::config::target_from_ssh_host(h);
         let name = target.name.clone();
+        // If this is the first target, mark it as default so it's
+        // auto-selected in the UI and the user can start dropping files
+        // immediately without another click.
+        let was_empty = self.cfg.targets.is_empty();
         self.cfg.targets.push(target.clone());
+        if was_empty {
+            self.cfg.default_target = Some(name.clone());
+        }
         self.rebuild_target_rows();
         self.persist_config();
 
@@ -1046,11 +1053,29 @@ impl App {
             self.toast("no target selected");
             return;
         }
+        // Filter out targets whose latest preflight said they're not OK; this
+        // protects the Auto mode flow from silently enqueueing failures.
+        // NoRsync is kept — the transfer will fail fast on the remote side and
+        // user can react, rather than having us silently drop it.
+        let (ok, skipped): (Vec<String>, Vec<String>) = target_names.into_iter().partition(|tn| {
+            self.target_rows
+                .iter()
+                .find(|r| r.name == *tn)
+                .map(|r| !matches!(r.status, TargetStatus::Unreachable(_)))
+                .unwrap_or(true)
+        });
+        if ok.is_empty() {
+            self.toast(&format!(
+                "all selected targets unreachable ({})",
+                skipped.join(", ")
+            ));
+            return;
+        }
         let files: Vec<PathBuf> = std::mem::take(&mut self.queue);
         self.queue_cursor = 0;
 
         for file in &files {
-            for tname in &target_names {
+            for tname in &ok {
                 let Some(t) = self.cfg.target_by_name(tname) else {
                     continue;
                 };
@@ -1062,11 +1087,20 @@ impl App {
                 transfer::spawn(id, t.clone(), file.clone(), self.transfer_tx.clone());
             }
         }
-        self.toast(&format!(
-            "sync {} file(s) → {} target(s)",
-            files.len(),
-            target_names.len()
-        ));
+        if skipped.is_empty() {
+            self.toast(&format!(
+                "sync {} file(s) → {} target(s)",
+                files.len(),
+                ok.len()
+            ));
+        } else {
+            self.toast(&format!(
+                "sync {} file(s) → {} (skipped {})",
+                files.len(),
+                ok.join(", "),
+                skipped.join(", ")
+            ));
+        }
     }
 
     fn handle_transfer_event(&mut self, ev: TransferEvent) {
