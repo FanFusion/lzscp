@@ -1,55 +1,61 @@
 # lzscp
 
-**Lazy SCP** — a local terminal UI that makes it trivial to push files from your
-laptop to a remote server and get the absolute remote path back on your
-clipboard.
+> Because `scp` is 3 characters but still too much trouble.
 
-Built for the SSH + tmux + Claude Code / Codex workflow: drop a screenshot in,
-paste the returned path into your remote LLM, done.
+## What is this?
 
-## Why
+A local TUI that makes pushing a file from your laptop to an SSH server brain-dead simple:
 
-When you live in an SSH session, sharing a local file with the remote side
-usually means:
+**drop file into TUI → remote absolute path lands on your clipboard → paste into Claude Code on the remote box → done.**
 
-1. Open a second tool (Cursor Remote SSH, Finder + `scp`, rsync by hand)
-2. Drag or copy the file over
-3. Copy the resulting path
-4. Paste it back into your remote editor / agent
+## Origin Story
 
-`lzscp` collapses those four steps into one: **drop a file into the TUI →
-path is on your clipboard.**
+I SSH into a server all day and run Claude Code / Codex inside tmux. Every time I wanted to show the agent a local screenshot, the flow was:
 
-## Features
+1. Open Cursor Remote SSH (wait forever)
+2. Drag file into a folder
+3. Copy the path
+4. Paste into Claude Code
+5. Curse
 
-- Drop files or paste paths — bracketed paste captures both
-- Handles quotes, escaped spaces, `file://` URLs, Chinese + emoji filenames
-- rsync backend with live progress (`--info=progress2`)
-- Multi-host fan-out with named groups
-- Auto / manual sync modes
-- Configurable clipboard format (`remote_path`, `scp_style`, `ssh_path`, `custom`)
-- Project-local (`.lzscp/config.toml`) or global (`~/.config/lzscp/config.toml`)
-  configuration
-- Update check from a single `VERSION` file
+So I made `lzscp`. Drag into TUI, get path, paste. One step.
+
+Like lzgit, I don't write Rust. Claude Code wrote all of it. I mostly said "no, spaces and Chinese filenames *also* need to work."
 
 ## Install
 
-### From release binaries
+```bash
+curl -fsSL https://raw.githubusercontent.com/FanFusion/lzscp/main/install.sh | bash
+```
 
-Download from [Releases](https://github.com/FanFusion/lzscp/releases):
+Auto-detects Linux / macOS, x86_64 / arm64, downloads the matching binary to `~/.local/bin/lzscp`. Works on everything the GH Actions matrix builds.
+
+Overrides:
+
+```bash
+# Install to somewhere else
+INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/FanFusion/lzscp/main/install.sh | bash
+
+# Pin to a specific version
+VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/FanFusion/lzscp/main/install.sh | bash
+```
+
+### Manual download
+
+Grab a prebuilt binary from [Releases](https://github.com/FanFusion/lzscp/releases/latest):
 
 ```bash
 # macOS (Apple Silicon)
-curl -L https://github.com/FanFusion/lzscp/releases/latest/download/lzscp-macos-aarch64 \
-  -o lzscp && chmod +x lzscp && mv lzscp ~/.local/bin/
+curl -fsSL https://github.com/FanFusion/lzscp/releases/latest/download/lzscp-macos-aarch64 -o ~/.local/bin/lzscp && chmod +x ~/.local/bin/lzscp
 
 # macOS (Intel)
-curl -L https://github.com/FanFusion/lzscp/releases/latest/download/lzscp-macos-x86_64 \
-  -o lzscp && chmod +x lzscp && mv lzscp ~/.local/bin/
+curl -fsSL https://github.com/FanFusion/lzscp/releases/latest/download/lzscp-macos-x86_64 -o ~/.local/bin/lzscp && chmod +x ~/.local/bin/lzscp
 
 # Linux (x86_64)
-curl -L https://github.com/FanFusion/lzscp/releases/latest/download/lzscp-linux-x86_64 \
-  -o lzscp && chmod +x lzscp && mv lzscp ~/.local/bin/
+curl -fsSL https://github.com/FanFusion/lzscp/releases/latest/download/lzscp-linux-x86_64 -o ~/.local/bin/lzscp && chmod +x ~/.local/bin/lzscp
+
+# Linux (aarch64)
+curl -fsSL https://github.com/FanFusion/lzscp/releases/latest/download/lzscp-linux-aarch64 -o ~/.local/bin/lzscp && chmod +x ~/.local/bin/lzscp
 ```
 
 ### From source
@@ -60,14 +66,20 @@ cargo install --path .
 cargo build --release && install -m 755 target/release/lzscp ~/.local/bin/lzscp
 ```
 
+### AI-era install
+
+```
+claude "install lzscp from https://raw.githubusercontent.com/FanFusion/lzscp/main/README.md"
+```
+
 ## Configure
 
-Copy [`examples/config.toml`](examples/config.toml) to either:
+Drop a `config.toml` at either:
 
-- `~/.config/lzscp/config.toml` — global default
-- `$PWD/.lzscp/config.toml` — per-project override (takes priority)
+- `$PWD/.lzscp/config.toml` — per-project (takes priority)
+- `~/.config/lzscp/config.toml` — global fallback
 
-Minimal config:
+Minimum:
 
 ```toml
 default_target = "dev"
@@ -79,13 +91,17 @@ user       = "ubuntu"
 remote_dir = "~/uploads"
 ```
 
+See [`examples/config.toml`](examples/config.toml) for every option (multi-host fan-out, clipboard format, custom templates, SSH port / key, etc.).
+
 ## Use
 
 ```bash
 lzscp
 ```
 
-Then in the TUI:
+Then drag a file in from your OS file manager, or `Cmd+V` / `Ctrl+Shift+V` a path. It rsyncs to the selected target and the remote absolute path is on your clipboard. Paste wherever you need it (Claude Code, Codex, editor, terminal, whatever).
+
+### Keys
 
 | Key              | Action                                    |
 | ---------------- | ----------------------------------------- |
@@ -101,33 +117,34 @@ Then in the TUI:
 | `?`              | Help overlay                              |
 | `q` / `Ctrl+C`   | Quit                                      |
 
-Drag a file from your OS file manager into the terminal, or `Cmd+V` / `Ctrl+Shift+V`
-a path from the clipboard. Works with spaces, Chinese characters, and emoji
-filenames across iTerm2, Terminal.app, Ghostty, kitty, WezTerm, Alacritty,
-GNOME Terminal, and Windows Terminal.
+Works across iTerm2, Terminal.app, Ghostty, kitty, WezTerm, Alacritty, GNOME Terminal, Windows Terminal. Handles spaces, Chinese, Japanese, emoji filenames.
+
+## Features
+
+- **One gesture** – drag or paste, that's it
+- **rsync backend** with live progress (`--info=progress2`), resumable via `--partial`
+- **Multi-host fan-out** via named groups
+- **Auto / manual modes** – auto fires on paste, manual queues until Enter
+- **4 clipboard formats** – `remote_path`, `scp_style`, `ssh_path`, or a custom template with `{user} {host} {port} {path} {basename}` placeholders
+- **Robust path parser** – handles quotes, escaped spaces, `file://` URLs, UTF-8 (Chinese / Japanese / emoji)
+- **In-app update check** – `lzscp --check`
 
 ## Requirements
 
-- Local: `rsync` (almost always preinstalled)
-- Remote: `rsync` + `ssh` daemon; SSH key auth recommended (no password prompts)
+- **Local**: `rsync` (preinstalled on macOS and most Linux)
+- **Remote**: `rsync` + `sshd`; SSH key auth highly recommended (no password prompts)
 
 ## Troubleshooting
 
-**Pasted paths look garbled or come in character-by-character**
-Your terminal may not have bracketed paste enabled. On tmux, ensure you are
-running a recent version (3.0+) — passthrough of bracketed paste is default.
-On iTerm2: *Preferences → General → Selection → Applications in terminal may
-access clipboard* must be allowed.
+**Pasted paths arrive character-by-character**
+Your terminal doesn't have bracketed paste on. tmux 3.0+ passes it through by default. On iTerm2, enable *Applications in terminal may access clipboard*.
 
-**`ssh unreachable` on startup**
-lzscp uses `BatchMode=yes` for the preflight, so it fails if your key requires
-a passphrase not held by ssh-agent. Start `ssh-agent` and `ssh-add` your key,
-or configure a passphrase-less key.
+**`ssh unreachable` on a target**
+lzscp uses `BatchMode=no` for the actual rsync (so it can prompt) but the startup preflight assumes a key is in ssh-agent. Run `ssh-add ~/.ssh/your_key` first.
 
 **Remote `~` not expanded**
-First transfer to a host runs `ssh host echo $HOME` to resolve it. If that
-fails, set `remote_dir` to an absolute path instead.
+First sync to a host runs `ssh host echo $HOME` to resolve the home dir. If that fails for some reason, just set `remote_dir` to an absolute path.
 
 ## License
 
-MIT © FanFusion
+MIT — Do what you want. Claude wrote most of it anyway.
