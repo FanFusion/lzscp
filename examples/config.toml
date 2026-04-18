@@ -1,0 +1,49 @@
+# lzscp config.toml example
+#
+# Place this file at one of:
+#   - $PWD/.lzscp/config.toml              (per-project, loaded first)
+#   - $XDG_CONFIG_HOME/lzscp/config.toml   (global fallback)
+
+# Target selected automatically on startup. Omit to auto-select the first target.
+default_target = "dev"
+
+# auto  — paste / drop immediately triggers sync
+# manual — files queue up; press Enter to start
+default_mode = "auto"
+
+# remote_path | scp_style | ssh_path | custom
+clipboard_format = "remote_path"
+
+# Only used when clipboard_format = "custom".
+# Placeholders: {user} {host} {port} {path} {basename}
+clipboard_template = "{user}@{host}:{path}"
+
+# Optional — one of: mocha | tokyo_night | gruvbox | nord | dracula
+theme = "mocha"
+
+# --- Targets ---------------------------------------------------------------
+
+[[target]]
+name        = "dev"
+host        = "dev.example.com"
+user        = "ubuntu"
+remote_dir  = "~/uploads"         # ~ expands to remote $HOME at transfer time
+ssh_port    = 22                   # optional, defaults to 22
+# ssh_key   = "~/.ssh/id_rsa"      # optional, defaults to ssh-agent / ~/.ssh/id_*
+# clipboard_format = "scp_style"   # optional per-target override
+
+[[target]]
+name        = "staging"
+host        = "staging.example.com"
+user        = "deploy"
+remote_dir  = "/tmp/uploads"
+
+# --- Groups ----------------------------------------------------------------
+# A group is a named bundle of targets. Selecting a group fans out the transfer
+# to all its members. `primary` controls which target's path is returned to the
+# clipboard after fan-out (defaults to the first).
+
+[[group]]
+name     = "all-dev"
+targets  = ["dev", "staging"]
+primary  = "dev"
