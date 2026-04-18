@@ -129,6 +129,9 @@ async fn run_app(
             Some(prog) = app.transfer_rx.recv() => {
                 app.handle_event(AppEvent::TransferUpdate(prog));
             }
+            Some(app_evt) = app.app_rx.recv() => {
+                app.handle_event(app_evt);
+            }
         }
     }
 

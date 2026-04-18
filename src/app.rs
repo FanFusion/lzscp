@@ -13,6 +13,19 @@ use crate::transfer::{self, Transfer, TransferEvent, TransferState};
 pub enum AppEvent {
     Terminal(Event),
     TransferUpdate(TransferEvent),
+    UpdateCheckResult(std::result::Result<Option<String>, String>),
+    UpdateInstallResult(std::result::Result<Vec<PathBuf>, String>),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum UpdateStatus {
+    #[default]
+    Idle,
+    Checking,
+    Available(String),  // newer version
+    Installing(String), // version being installed
+    Installed(Vec<PathBuf>),
+    Failed(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,8 +71,12 @@ pub struct App {
     pub toast: Option<(String, std::time::Instant)>,
     pub help_visible: bool,
 
+    pub update_status: UpdateStatus,
+
     pub transfer_tx: mpsc::UnboundedSender<TransferEvent>,
     pub transfer_rx: mpsc::UnboundedReceiver<TransferEvent>,
+    pub app_tx: mpsc::UnboundedSender<AppEvent>,
+    pub app_rx: mpsc::UnboundedReceiver<AppEvent>,
 }
 
 impl App {
@@ -95,6 +112,7 @@ impl App {
         let mode = cfg.default_mode;
         let clipboard_format = cfg.clipboard_format;
         let (tx, rx) = mpsc::unbounded_channel();
+        let (app_tx, app_rx) = mpsc::unbounded_channel();
 
         Self {
             cfg,
@@ -113,8 +131,11 @@ impl App {
             last_clipboard: None,
             toast: None,
             help_visible: false,
+            update_status: UpdateStatus::Idle,
             transfer_tx: tx,
             transfer_rx: rx,
+            app_tx,
+            app_rx,
         }
     }
 
@@ -137,11 +158,42 @@ impl App {
             },
             AppEvent::Terminal(_) => {}
             AppEvent::TransferUpdate(u) => self.handle_transfer_event(u),
+            AppEvent::UpdateCheckResult(r) => self.handle_update_check_result(r),
+            AppEvent::UpdateInstallResult(r) => self.handle_update_install_result(r),
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
+            return;
+        }
+        // Ctrl+C always quits, even through modals.
+        if let KeyCode::Char('c') = key.code
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.should_quit = true;
+            return;
+        }
+        // Update confirm modal swallows keys: y confirms, n/Esc dismisses.
+        if let UpdateStatus::Available(ref v) = self.update_status {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    let ver = v.clone();
+                    self.start_update_install(ver);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.update_status = UpdateStatus::Idle;
+                }
+                _ => {}
+            }
+            return;
+        }
+        // Dismissable terminal states: any key clears.
+        if matches!(
+            self.update_status,
+            UpdateStatus::Installed(_) | UpdateStatus::Failed(_)
+        ) {
+            self.update_status = UpdateStatus::Idle;
             return;
         }
         if self.help_visible {
@@ -150,10 +202,8 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true;
-            }
             KeyCode::Char('?') => self.help_visible = true,
+            KeyCode::Char('u') => self.start_update_check(),
             KeyCode::Tab => self.cycle_focus(1),
             KeyCode::BackTab => self.cycle_focus(-1),
             KeyCode::Char('a') => {
@@ -189,6 +239,62 @@ impl App {
                 self.queue_cursor = 0;
             }
             _ => {}
+        }
+    }
+
+    fn start_update_check(&mut self) {
+        if matches!(
+            self.update_status,
+            UpdateStatus::Checking | UpdateStatus::Installing(_)
+        ) {
+            return;
+        }
+        self.update_status = UpdateStatus::Checking;
+        let tx = self.app_tx.clone();
+        tokio::spawn(async move {
+            let r = match crate::update::check_for_updates().await {
+                Ok(v) => Ok(v),
+                Err(e) => Err(format!("{e:#}")),
+            };
+            let _ = tx.send(AppEvent::UpdateCheckResult(r));
+        });
+    }
+
+    fn handle_update_check_result(&mut self, r: std::result::Result<Option<String>, String>) {
+        match r {
+            Ok(Some(v)) => {
+                self.update_status = UpdateStatus::Available(v);
+            }
+            Ok(None) => {
+                self.update_status = UpdateStatus::Idle;
+                self.toast(&format!("up to date (v{})", crate::VERSION));
+            }
+            Err(e) => {
+                self.update_status = UpdateStatus::Failed(e);
+            }
+        }
+    }
+
+    fn start_update_install(&mut self, version: String) {
+        self.update_status = UpdateStatus::Installing(version.clone());
+        let tx = self.app_tx.clone();
+        tokio::spawn(async move {
+            let r = match crate::update::download_and_install(&version).await {
+                Ok(paths) => Ok(paths),
+                Err(e) => Err(format!("{e:#}")),
+            };
+            let _ = tx.send(AppEvent::UpdateInstallResult(r));
+        });
+    }
+
+    fn handle_update_install_result(&mut self, r: std::result::Result<Vec<PathBuf>, String>) {
+        match r {
+            Ok(paths) => {
+                self.update_status = UpdateStatus::Installed(paths);
+            }
+            Err(e) => {
+                self.update_status = UpdateStatus::Failed(e);
+            }
         }
     }
 

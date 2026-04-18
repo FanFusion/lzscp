@@ -6,7 +6,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap};
 
-use crate::app::{App, Focus, TargetKind};
+use crate::app::{App, Focus, TargetKind, UpdateStatus};
 use crate::target::SyncMode;
 use crate::transfer::TransferState;
 
@@ -36,6 +36,146 @@ pub fn draw(f: &mut Frame<'_>, app: &App) {
     if app.help_visible {
         draw_help_overlay(f, size, &palette);
     }
+    if !matches!(app.update_status, UpdateStatus::Idle) {
+        draw_update_overlay(f, size, app, &palette);
+    }
+}
+
+fn draw_update_overlay(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
+    let w = 60.min(area.width.saturating_sub(4));
+    let h = 10.min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    let (title, lines): (&str, Vec<Line>) = match &app.update_status {
+        UpdateStatus::Idle => (" Update ", vec![]),
+        UpdateStatus::Checking => (
+            " Update ",
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Checking for updates…",
+                    Style::default().fg(p.fg),
+                )),
+            ],
+        ),
+        UpdateStatus::Available(v) => (
+            " Update available ",
+            vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  current: ", Style::default().fg(p.muted)),
+                    Span::styled(format!("v{}", crate::VERSION), Style::default().fg(p.fg)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  latest:  ", Style::default().fg(p.muted)),
+                    Span::styled(
+                        format!("v{v}"),
+                        Style::default().fg(p.diff_add).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Download and install now?",
+                    Style::default().fg(p.fg),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(
+                        " y ",
+                        Style::default()
+                            .fg(p.bg)
+                            .bg(p.diff_add)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("  confirm     ", Style::default().fg(p.muted)),
+                    Span::styled(
+                        " n / Esc ",
+                        Style::default()
+                            .fg(p.bg)
+                            .bg(p.muted)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("  cancel", Style::default().fg(p.muted)),
+                ]),
+            ],
+        ),
+        UpdateStatus::Installing(v) => (
+            " Updating ",
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("  Downloading v{v}…"),
+                    Style::default().fg(p.fg),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  (~5 MB binary; may take a while on slow links)",
+                    Style::default().fg(p.muted),
+                )),
+            ],
+        ),
+        UpdateStatus::Installed(paths) => {
+            let mut lines = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Update installed.",
+                    Style::default().fg(p.diff_add).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+            ];
+            for p_ in paths {
+                lines.push(Line::from(Span::styled(
+                    format!("    {}", p_.display()),
+                    Style::default().fg(p.muted),
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  Restart lzscp to use the new version.",
+                Style::default().fg(p.fg),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  (press any key to dismiss)",
+                Style::default().fg(p.muted),
+            )));
+            (" Update complete ", lines)
+        }
+        UpdateStatus::Failed(e) => (
+            " Update failed ",
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Could not update:",
+                    Style::default().fg(p.diff_del).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(format!("  {e}"), Style::default().fg(p.fg))),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  (press any key to dismiss)",
+                    Style::default().fg(p.muted),
+                )),
+            ],
+        ),
+    };
+
+    let border_color = match &app.update_status {
+        UpdateStatus::Available(_) => p.diff_add,
+        UpdateStatus::Failed(_) => p.diff_del,
+        _ => p.accent,
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(p.bg).fg(p.fg));
+    f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 fn draw_title(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
@@ -304,7 +444,12 @@ fn draw_help_bar(f: &mut Frame<'_>, area: Rect, _app: &App, p: &theme::Palette) 
             " c ",
             Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("clipboard-fmt  ", Style::default().fg(p.muted)),
+        Span::styled("clip-fmt  ", Style::default().fg(p.muted)),
+        Span::styled(
+            " u ",
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("update  ", Style::default().fg(p.muted)),
         Span::styled(
             " ? ",
             Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
@@ -339,6 +484,7 @@ fn draw_help_overlay(f: &mut Frame<'_>, area: Rect, p: &theme::Palette) {
         Line::from("  Enter              execute sync (manual)"),
         Line::from("  a / m              auto / manual mode"),
         Line::from("  c                  cycle clipboard format"),
+        Line::from("  u                  check for update"),
         Line::from("  Backspace          remove queued file under cursor"),
         Line::from("  x                  clear queue"),
         Line::from("  ?                  toggle this help"),
