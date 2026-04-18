@@ -1,6 +1,6 @@
 [package]
 name = "lzscp"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Lazy SCP — a local TUI for drag-drop file sync to SSH hosts with auto clipboard path return"
 readme = "README.md"

@@ -6,13 +6,16 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap};
 
-use crate::app::{App, Focus, TargetKind, UpdateStatus};
+use crate::app::{App, Focus, HelpBarAction, HitRegions, ModalHit, TargetKind, UpdateStatus};
 use crate::target::SyncMode;
 use crate::transfer::TransferState;
 
-pub fn draw(f: &mut Frame<'_>, app: &App) {
+pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     let palette = theme::palette(&app.cfg.theme);
     let size = f.area();
+
+    // Reset hit-test regions for this frame.
+    app.hit_regions = HitRegions::default();
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -26,6 +29,10 @@ pub fn draw(f: &mut Frame<'_>, app: &App) {
         ])
         .split(size);
 
+    app.hit_regions.drop_zone = chunks[1];
+    app.hit_regions.targets_panel = chunks[2];
+    app.hit_regions.progress_panel = chunks[3];
+
     draw_title(f, chunks[0], app, &palette);
     draw_drop_zone(f, chunks[1], app, &palette);
     draw_targets(f, chunks[2], app, &palette);
@@ -35,18 +42,21 @@ pub fn draw(f: &mut Frame<'_>, app: &App) {
 
     if app.help_visible {
         draw_help_overlay(f, size, &palette);
+        // Help overlay consumes its own rect for click dismissal.
+        app.hit_regions.modal_area = Some(size);
     }
     if !matches!(app.update_status, UpdateStatus::Idle) {
         draw_update_overlay(f, size, app, &palette);
     }
 }
 
-fn draw_update_overlay(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
+fn draw_update_overlay(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
     let w = 60.min(area.width.saturating_sub(4));
     let h = 10.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect::new(x, y, w, h);
+    app.hit_regions.modal_area = Some(rect);
 
     let (title, lines): (&str, Vec<Line>) = match &app.update_status {
         UpdateStatus::Idle => (" Update ", vec![]),
@@ -176,9 +186,30 @@ fn draw_update_overlay(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Pale
         )
         .style(Style::default().bg(p.bg).fg(p.fg));
     f.render_widget(Paragraph::new(lines).block(block), rect);
+
+    // Click zones.
+    match &app.update_status {
+        UpdateStatus::Available(_) => {
+            // The button row is the last visible line (second to last before
+            // border). In our layout that's rect.y + 8 (border + 7 lines of
+            // content; button row is the 7th content line → index 7).
+            let btn_row = rect.y + 8;
+            if btn_row < rect.y + rect.height.saturating_sub(1) {
+                let y_btn = Rect::new(rect.x + 2, btn_row, 4, 1);
+                let n_btn = Rect::new(rect.x + 21, btn_row, 9, 1);
+                app.hit_regions.modal_hits.push((y_btn, ModalHit::Confirm));
+                app.hit_regions.modal_hits.push((n_btn, ModalHit::Cancel));
+            }
+        }
+        UpdateStatus::Installed(_) | UpdateStatus::Failed(_) => {
+            // Whole modal body dismisses.
+            app.hit_regions.modal_hits.push((rect, ModalHit::Dismiss));
+        }
+        _ => {}
+    }
 }
 
-fn draw_title(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
+fn draw_title(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
     let mode = match app.mode {
         SyncMode::Auto => "auto",
         SyncMode::Manual => "manual",
@@ -207,7 +238,7 @@ fn draw_title(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
     );
 }
 
-fn draw_drop_zone(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
+fn draw_drop_zone(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
     let focused = app.focus == Focus::DropZone;
     let title = if app.queue.is_empty() {
         " Drop files / paste paths "
@@ -243,6 +274,20 @@ fn draw_drop_zone(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) 
         return;
     }
 
+    // Record clickable rows (one row per queue item, starting below the top
+    // border at area.y + 1).
+    let inner_x = area.x + 1;
+    let inner_w = area.width.saturating_sub(2);
+    for (i, _) in app.queue.iter().enumerate() {
+        let row_y = area.y + 1 + i as u16;
+        if row_y >= area.y + area.height.saturating_sub(1) {
+            break;
+        }
+        app.hit_regions
+            .queue_rows
+            .push(Rect::new(inner_x, row_y, inner_w, 1));
+    }
+
     let items: Vec<ListItem> = app
         .queue
         .iter()
@@ -266,7 +311,7 @@ fn draw_drop_zone(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) 
     f.render_widget(List::new(items).block(block), area);
 }
 
-fn draw_targets(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
+fn draw_targets(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
     let focused = app.focus == Focus::Targets;
     let block = Block::default()
         .title(Line::from(" Targets "))
@@ -289,6 +334,20 @@ fn draw_targets(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
         .block(block);
         f.render_widget(p1, area);
         return;
+    }
+
+    // Record clickable rows (each target occupies one line).
+    let inner_x = area.x + 1;
+    let inner_w = area.width.saturating_sub(2);
+    for (i, _) in app.target_rows.iter().enumerate() {
+        let row_y = area.y + 1 + i as u16;
+        if row_y >= area.y + area.height.saturating_sub(1) {
+            break;
+        }
+        app.hit_regions
+            .target_rows
+            .push(Rect::new(inner_x, row_y, inner_w, 1));
+        let _ = i; // silence unused warning if row loop logic changes
     }
 
     let items: Vec<ListItem> = app
@@ -322,7 +381,7 @@ fn draw_targets(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
     f.render_widget(List::new(items).block(block), area);
 }
 
-fn draw_progress(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
+fn draw_progress(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
     let focused = app.focus == Focus::Progress;
     let block = Block::default()
         .title(Line::from(" Progress "))
@@ -381,7 +440,7 @@ fn draw_progress(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
     }
 }
 
-fn draw_status(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
+fn draw_status(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(1)])
@@ -418,50 +477,50 @@ fn draw_status(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
     );
 }
 
-fn draw_help_bar(f: &mut Frame<'_>, area: Rect, _app: &App, p: &theme::Palette) {
-    let help = Line::from(vec![
-        Span::styled(
-            " Tab ",
+fn draw_help_bar(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
+    // (key-label, description, click action)
+    let chips: [(&str, &str, HelpBarAction); 8] = [
+        ("Tab", "focus", HelpBarAction::CycleFocus),
+        ("Space", "toggle", HelpBarAction::ToggleSelection),
+        ("Enter", "sync", HelpBarAction::Sync),
+        ("a/m", "mode", HelpBarAction::CycleMode),
+        ("c", "clip-fmt", HelpBarAction::CycleClipboard),
+        ("u", "update", HelpBarAction::CheckUpdate),
+        ("?", "help", HelpBarAction::ToggleHelp),
+        ("q", "quit", HelpBarAction::Quit),
+    ];
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(chips.len() * 3);
+    let mut cursor_x = area.x;
+    for (i, (key, desc, action)) in chips.iter().enumerate() {
+        let key_text: String = format!(" {key} ");
+        let desc_text: String = if i + 1 == chips.len() {
+            desc.to_string()
+        } else {
+            format!("{desc}  ")
+        };
+        let key_w = key_text.chars().count() as u16;
+        let desc_w = desc_text.chars().count() as u16;
+        let total_w = key_w + desc_w;
+
+        if cursor_x + total_w > area.x + area.width {
+            break; // ran out of space; silently drop remaining chips
+        }
+
+        app.hit_regions
+            .help_bar_hits
+            .push((Rect::new(cursor_x, area.y, total_w, 1), *action));
+
+        spans.push(Span::styled(
+            key_text,
             Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("focus  ", Style::default().fg(p.muted)),
-        Span::styled(
-            " Space ",
-            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("toggle  ", Style::default().fg(p.muted)),
-        Span::styled(
-            " Enter ",
-            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("sync  ", Style::default().fg(p.muted)),
-        Span::styled(
-            " a/m ",
-            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("auto/manual  ", Style::default().fg(p.muted)),
-        Span::styled(
-            " c ",
-            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("clip-fmt  ", Style::default().fg(p.muted)),
-        Span::styled(
-            " u ",
-            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("update  ", Style::default().fg(p.muted)),
-        Span::styled(
-            " ? ",
-            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("help  ", Style::default().fg(p.muted)),
-        Span::styled(
-            " q ",
-            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("quit", Style::default().fg(p.muted)),
-    ]);
-    f.render_widget(Paragraph::new(help).style(Style::default().bg(p.bg)), area);
+        ));
+        spans.push(Span::styled(desc_text, Style::default().fg(p.muted)));
+        cursor_x += total_w;
+    }
+
+    let line = Line::from(spans);
+    f.render_widget(Paragraph::new(line).style(Style::default().bg(p.bg)), area);
 }
 
 fn draw_help_overlay(f: &mut Frame<'_>, area: Rect, p: &theme::Palette) {

@@ -115,7 +115,7 @@ async fn run_app(
     let mut tick = interval(Duration::from_millis(100));
 
     while !app.should_quit {
-        terminal.draw(|f| ui::draw(f, &app))?;
+        terminal.draw(|f| ui::draw(f, &mut app))?;
 
         tokio::select! {
             maybe_evt = events.next() => {

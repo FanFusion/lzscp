@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
 use crate::config::Config;
@@ -33,6 +36,41 @@ pub enum Focus {
     DropZone,
     Targets,
     Progress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelpBarAction {
+    CycleFocus,
+    ToggleSelection,
+    Sync,
+    CycleMode,
+    CycleClipboard,
+    CheckUpdate,
+    ToggleHelp,
+    Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModalHit {
+    Confirm,
+    Cancel,
+    Dismiss,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct HitRegions {
+    pub drop_zone: Rect,
+    pub queue_rows: Vec<Rect>,
+    pub targets_panel: Rect,
+    pub target_rows: Vec<Rect>,
+    pub progress_panel: Rect,
+    pub help_bar_hits: Vec<(Rect, HelpBarAction)>,
+    pub modal_area: Option<Rect>,
+    pub modal_hits: Vec<(Rect, ModalHit)>,
+}
+
+fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +110,7 @@ pub struct App {
     pub help_visible: bool,
 
     pub update_status: UpdateStatus,
+    pub hit_regions: HitRegions,
 
     pub transfer_tx: mpsc::UnboundedSender<TransferEvent>,
     pub transfer_rx: mpsc::UnboundedReceiver<TransferEvent>,
@@ -132,6 +171,7 @@ impl App {
             toast: None,
             help_visible: false,
             update_status: UpdateStatus::Idle,
+            hit_regions: HitRegions::default(),
             transfer_tx: tx,
             transfer_rx: rx,
             app_tx,
@@ -151,15 +191,122 @@ impl App {
         match evt {
             AppEvent::Terminal(Event::Key(k)) => self.handle_key(k),
             AppEvent::Terminal(Event::Paste(s)) => self.handle_paste(&s),
-            AppEvent::Terminal(Event::Mouse(m)) => match m.kind {
-                MouseEventKind::ScrollDown => self.move_cursor(1),
-                MouseEventKind::ScrollUp => self.move_cursor(-1),
-                _ => {}
-            },
+            AppEvent::Terminal(Event::Mouse(m)) => self.handle_mouse(m),
             AppEvent::Terminal(_) => {}
             AppEvent::TransferUpdate(u) => self.handle_transfer_event(u),
             AppEvent::UpdateCheckResult(r) => self.handle_update_check_result(r),
             AppEvent::UpdateInstallResult(r) => self.handle_update_install_result(r),
+        }
+    }
+
+    fn handle_mouse(&mut self, m: MouseEvent) {
+        match m.kind {
+            MouseEventKind::ScrollDown => self.move_cursor(1),
+            MouseEventKind::ScrollUp => self.move_cursor(-1),
+            MouseEventKind::Down(MouseButton::Left) => self.handle_click(m.column, m.row),
+            _ => {}
+        }
+    }
+
+    fn handle_click(&mut self, x: u16, y: u16) {
+        // Modal takes precedence.
+        if let Some(modal) = self.hit_regions.modal_area
+            && rect_contains(modal, x, y)
+        {
+            for (r, hit) in &self.hit_regions.modal_hits.clone() {
+                if rect_contains(*r, x, y) {
+                    match hit {
+                        ModalHit::Confirm => {
+                            if let UpdateStatus::Available(v) = &self.update_status {
+                                let ver = v.clone();
+                                self.start_update_install(ver);
+                            }
+                        }
+                        ModalHit::Cancel | ModalHit::Dismiss => {
+                            self.update_status = UpdateStatus::Idle;
+                        }
+                    }
+                    return;
+                }
+            }
+            // Click inside Installed / Failed modal body but not on a specific
+            // hit zone — treat as "dismiss".
+            if matches!(
+                self.update_status,
+                UpdateStatus::Installed(_) | UpdateStatus::Failed(_)
+            ) {
+                self.update_status = UpdateStatus::Idle;
+            }
+            return;
+        }
+
+        if self.help_visible {
+            // Any click outside/inside the overlay dismisses it.
+            self.help_visible = false;
+            return;
+        }
+
+        // Help-bar chips.
+        for (r, action) in &self.hit_regions.help_bar_hits.clone() {
+            if rect_contains(*r, x, y) {
+                self.trigger_help_bar_action(*action);
+                return;
+            }
+        }
+
+        // Target row click → focus targets + toggle that row.
+        for (i, r) in self.hit_regions.target_rows.clone().iter().enumerate() {
+            if rect_contains(*r, x, y) {
+                self.focus = Focus::Targets;
+                if i < self.target_rows.len() {
+                    self.target_cursor = i;
+                    self.toggle_target_cursor();
+                }
+                return;
+            }
+        }
+
+        // Queue row click → focus drop zone + move cursor.
+        for (i, r) in self.hit_regions.queue_rows.clone().iter().enumerate() {
+            if rect_contains(*r, x, y) {
+                self.focus = Focus::DropZone;
+                if i < self.queue.len() {
+                    self.queue_cursor = i;
+                }
+                return;
+            }
+        }
+
+        // Panel background click → focus that panel.
+        if rect_contains(self.hit_regions.drop_zone, x, y) {
+            self.focus = Focus::DropZone;
+        } else if rect_contains(self.hit_regions.targets_panel, x, y) {
+            self.focus = Focus::Targets;
+        } else if rect_contains(self.hit_regions.progress_panel, x, y) {
+            self.focus = Focus::Progress;
+        }
+    }
+
+    fn trigger_help_bar_action(&mut self, a: HelpBarAction) {
+        match a {
+            HelpBarAction::CycleFocus => self.cycle_focus(1),
+            HelpBarAction::ToggleSelection => {
+                if self.focus == Focus::Targets {
+                    self.toggle_target_cursor();
+                }
+            }
+            HelpBarAction::Sync => self.start_queue_sync(),
+            HelpBarAction::CycleMode => {
+                self.mode = match self.mode {
+                    SyncMode::Auto => SyncMode::Manual,
+                    SyncMode::Manual => SyncMode::Auto,
+                };
+                self.toast(&format!("mode: {:?}", self.mode).to_lowercase());
+            }
+            HelpBarAction::CycleClipboard => self.cycle_clipboard_format(),
+            HelpBarAction::CheckUpdate => self.start_update_check(),
+            HelpBarAction::ToggleHelp => self.help_visible = !self.help_visible,
+            HelpBarAction::Quit => self.should_quit = true,
         }
     }
 
