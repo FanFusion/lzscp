@@ -86,10 +86,6 @@ pub fn load() -> Result<Config> {
         Config::default()
     };
 
-    // Merge hosts from ~/.ssh/config. Explicit TOML targets win on name
-    // collision (so a user can override the auto-detected default).
-    merge_ssh_config(&mut cfg);
-
     // Pick a sensible default target if none set and we have any targets.
     if cfg.default_target.is_none()
         && let Some(first) = cfg.targets.first()
@@ -99,25 +95,16 @@ pub fn load() -> Result<Config> {
     Ok(cfg)
 }
 
-fn merge_ssh_config(cfg: &mut Config) {
-    let existing_names: std::collections::HashSet<String> =
-        cfg.targets.iter().map(|t| t.name.clone()).collect();
-    for h in crate::ssh_config::load() {
-        if existing_names.contains(&h.name) {
-            continue;
-        }
-        // Skip SSH config blocks that clearly aren't login hosts (e.g. `Host
-        // github.com` present for key routing). We have no cheap signal here
-        // beyond the host pattern — let them through and let preflight decide.
-        cfg.targets.push(Target {
-            name: h.name,
-            host: h.hostname.unwrap_or_default(),
-            user: h.user,
-            remote_dir: "~/lzscp-inbox".to_string(),
-            ssh_port: h.port,
-            ssh_key: h.identity_file,
-            clipboard_format: None,
-        });
+/// Build a Target from an SSH-config host, using a default remote inbox dir.
+pub fn target_from_ssh_host(h: crate::ssh_config::SshHost) -> Target {
+    Target {
+        name: h.name.clone(),
+        host: h.hostname.unwrap_or(h.name),
+        user: h.user,
+        remote_dir: "~/lzscp-inbox".to_string(),
+        ssh_port: h.port,
+        ssh_key: h.identity_file,
+        clipboard_format: None,
     }
 }
 

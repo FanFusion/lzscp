@@ -242,15 +242,14 @@ pub fn parse_progress_line(line: &str) -> Option<Progress> {
     })
 }
 
+/// Expand remote_dir's `~` / `$HOME` *and* create the directory on the remote.
+/// Returns the absolute remote path.
 async fn resolve_remote_home(target: &Target) -> Result<String> {
-    // If remote_dir doesn't start with `~` we keep it literal.
-    if !target.remote_dir.starts_with('~') {
-        return Ok(target.remote_dir.clone());
-    }
-
-    // Ask the remote for $HOME once.
+    // Single round-trip: let the remote shell expand $HOME, mkdir -p, print the
+    // resolved absolute path. This both fixes "~/foo doesn't exist" and removes
+    // a second ssh call on the hot path.
     let mut cmd = Command::new("ssh");
-    cmd.arg("-o").arg("BatchMode=no");
+    cmd.arg("-o").arg("BatchMode=yes");
     cmd.arg("-o").arg("ConnectTimeout=10");
     cmd.arg("-p").arg(target.ssh_port().to_string());
     if let Some(key) = &target.ssh_key {
@@ -262,26 +261,41 @@ async fn resolve_remote_home(target: &Target) -> Result<String> {
         None => target.host.clone(),
     };
     cmd.arg(addr);
-    cmd.arg("echo $HOME");
+    // Use single quotes locally and escape the remote_dir value — the remote
+    // shell expands ~ / $HOME.
+    let script = format!(
+        r#"d={remote}; d="${{d/#~/$HOME}}"; mkdir -p "$d" && cd "$d" && pwd"#,
+        remote = shell_single_quote(&target.remote_dir)
+    );
+    cmd.arg(script);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let output = cmd.output().await.context("ssh echo $HOME")?;
+    let output = cmd.output().await.context("ssh mkdir -p")?;
     if !output.status.success() {
         anyhow::bail!(
-            "ssh home probe failed: {}",
+            "ssh remote prep failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let home = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if home.is_empty() {
-        anyhow::bail!("remote $HOME is empty");
+    let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if resolved.is_empty() {
+        anyhow::bail!("remote dir resolution returned empty");
     }
-    let mut expanded = target.remote_dir.clone();
-    if expanded == "~" {
-        expanded = home;
-    } else if let Some(rest) = expanded.strip_prefix("~/") {
-        expanded = format!("{home}/{rest}");
+    Ok(resolved)
+}
+
+fn shell_single_quote(s: &str) -> String {
+    // Wrap s in single quotes, escaping any embedded single quotes.
+    // ' → '\''
+    let mut out = String::from("'");
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str(r"'\''");
+        } else {
+            out.push(c);
+        }
     }
-    Ok(expanded)
+    out.push('\'');
+    out
 }
 
 /// Ping one target: verify rsync + ssh connectivity. Used for UI status.

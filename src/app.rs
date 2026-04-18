@@ -62,13 +62,15 @@ pub enum HelpBarAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
-    CheckUpdate,
+    AddTargetFromSsh,
+    RemoveCurrentTarget,
     ReprobeTargets,
     InstallRsyncOnSelected,
     ToggleMode,
     CycleClipboardFormat,
     CycleTheme,
     ClearQueue,
+    CheckUpdate,
     Help,
     Quit,
 }
@@ -76,13 +78,15 @@ pub enum MenuAction {
 impl MenuAction {
     pub fn label(self) -> &'static str {
         match self {
-            MenuAction::CheckUpdate => "Check for update",
+            MenuAction::AddTargetFromSsh => "Add target from ~/.ssh/config",
+            MenuAction::RemoveCurrentTarget => "Remove selected target",
             MenuAction::ReprobeTargets => "Re-probe all targets",
             MenuAction::InstallRsyncOnSelected => "Install rsync on selected target",
             MenuAction::ToggleMode => "Toggle auto / manual mode",
             MenuAction::CycleClipboardFormat => "Cycle clipboard format",
             MenuAction::CycleTheme => "Cycle theme",
             MenuAction::ClearQueue => "Clear queue",
+            MenuAction::CheckUpdate => "Check for update",
             MenuAction::Help => "Show help",
             MenuAction::Quit => "Quit",
         }
@@ -90,13 +94,15 @@ impl MenuAction {
 
     pub fn shortcut(self) -> &'static str {
         match self {
-            MenuAction::CheckUpdate => "u",
+            MenuAction::AddTargetFromSsh => "+",
+            MenuAction::RemoveCurrentTarget => "-",
             MenuAction::ReprobeTargets => "r",
             MenuAction::InstallRsyncOnSelected => "i",
             MenuAction::ToggleMode => "a/m",
             MenuAction::CycleClipboardFormat => "c",
             MenuAction::CycleTheme => "t",
             MenuAction::ClearQueue => "x",
+            MenuAction::CheckUpdate => "u",
             MenuAction::Help => "?",
             MenuAction::Quit => "q",
         }
@@ -104,13 +110,15 @@ impl MenuAction {
 
     pub fn all() -> &'static [MenuAction] {
         &[
-            MenuAction::CheckUpdate,
+            MenuAction::AddTargetFromSsh,
+            MenuAction::RemoveCurrentTarget,
             MenuAction::ReprobeTargets,
             MenuAction::InstallRsyncOnSelected,
             MenuAction::ToggleMode,
             MenuAction::CycleClipboardFormat,
             MenuAction::CycleTheme,
             MenuAction::ClearQueue,
+            MenuAction::CheckUpdate,
             MenuAction::Help,
             MenuAction::Quit,
         ]
@@ -135,6 +143,7 @@ pub struct HitRegions {
     pub modal_area: Option<Rect>,
     pub modal_hits: Vec<(Rect, ModalHit)>,
     pub menu_rows: Vec<(Rect, MenuAction)>,
+    pub ssh_picker_rows: Vec<Rect>, // indexes match app.ssh_picker.list
 }
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
@@ -166,6 +175,12 @@ pub struct TargetRow {
     pub status: TargetStatus,
 }
 
+#[derive(Debug, Clone)]
+pub struct SshPicker {
+    pub list: Vec<crate::ssh_config::SshHost>,
+    pub cursor: usize,
+}
+
 pub struct App {
     pub cfg: Config,
     pub mode: SyncMode,
@@ -189,6 +204,8 @@ pub struct App {
     pub help_visible: bool,
     pub menu_visible: bool,
     pub menu_cursor: usize,
+
+    pub ssh_picker: Option<SshPicker>,
 
     pub update_status: UpdateStatus,
     pub hit_regions: HitRegions,
@@ -255,6 +272,7 @@ impl App {
             help_visible: false,
             menu_visible: false,
             menu_cursor: 0,
+            ssh_picker: None,
             update_status: UpdateStatus::Idle,
             hit_regions: HitRegions::default(),
             transfer_tx: tx,
@@ -293,6 +311,9 @@ impl App {
     }
 
     pub fn spawn_preflight_all(&mut self) {
+        if self.cfg.targets.is_empty() {
+            return;
+        }
         for row in &mut self.target_rows {
             if row.kind == TargetKind::Group {
                 continue;
@@ -391,6 +412,21 @@ impl App {
     }
 
     fn handle_click(&mut self, x: u16, y: u16) {
+        if self.ssh_picker.is_some() {
+            let rows = self.hit_regions.ssh_picker_rows.clone();
+            for (i, r) in rows.iter().enumerate() {
+                if rect_contains(*r, x, y) {
+                    if let Some(picker) = self.ssh_picker.as_mut() {
+                        picker.cursor = i;
+                    }
+                    self.add_picker_selection();
+                    return;
+                }
+            }
+            // Click outside picker dismisses.
+            self.ssh_picker = None;
+            return;
+        }
         // Menu takes precedence (it's drawn on top of everything else).
         if self.menu_visible {
             for (r, action) in self.hit_regions.menu_rows.clone() {
@@ -553,6 +589,18 @@ impl App {
             self.update_status = UpdateStatus::Idle;
             return;
         }
+        if self.ssh_picker.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.ssh_picker = None;
+                }
+                KeyCode::Up => self.picker_move(-1),
+                KeyCode::Down | KeyCode::Tab => self.picker_move(1),
+                KeyCode::Enter => self.add_picker_selection(),
+                _ => {}
+            }
+            return;
+        }
         if self.menu_visible {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
@@ -647,6 +695,8 @@ impl App {
 
     fn run_menu_action(&mut self, a: MenuAction) {
         match a {
+            MenuAction::AddTargetFromSsh => self.open_ssh_picker(),
+            MenuAction::RemoveCurrentTarget => self.remove_current_target(),
             MenuAction::CheckUpdate => self.start_update_check(),
             MenuAction::ReprobeTargets => {
                 self.spawn_preflight_all();
@@ -679,6 +729,146 @@ impl App {
             }
             MenuAction::Help => self.help_visible = true,
             MenuAction::Quit => self.should_quit = true,
+        }
+    }
+
+    fn open_ssh_picker(&mut self) {
+        let mut hosts = crate::ssh_config::load();
+        // Filter out hosts that are already configured.
+        let existing: std::collections::HashSet<String> =
+            self.cfg.targets.iter().map(|t| t.name.clone()).collect();
+        hosts.retain(|h| !existing.contains(&h.name));
+        if hosts.is_empty() {
+            self.toast("no SSH hosts found (or all already added)");
+            return;
+        }
+        self.ssh_picker = Some(SshPicker {
+            list: hosts,
+            cursor: 0,
+        });
+    }
+
+    pub fn add_picker_selection(&mut self) {
+        let Some(picker) = self.ssh_picker.as_ref() else {
+            return;
+        };
+        let Some(h) = picker.list.get(picker.cursor).cloned() else {
+            return;
+        };
+        self.ssh_picker = None;
+
+        let target = crate::config::target_from_ssh_host(h);
+        let name = target.name.clone();
+        self.cfg.targets.push(target.clone());
+        self.rebuild_target_rows();
+        self.persist_config();
+
+        // Kick off a preflight for the new target only.
+        let tx = self.app_tx.clone();
+        tokio::spawn(async move {
+            let status = match crate::transfer::preflight_full(&target).await {
+                Ok(_) => TargetStatus::Reachable,
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    if msg.contains("rsync not found on remote") {
+                        TargetStatus::NoRsync
+                    } else {
+                        TargetStatus::Unreachable(msg)
+                    }
+                }
+            };
+            let _ = tx.send(AppEvent::PreflightResult {
+                target_name: name,
+                status,
+            });
+        });
+        self.toast(&format!(
+            "added target: {}",
+            self.cfg
+                .targets
+                .last()
+                .map(|t| t.name.clone())
+                .unwrap_or_default()
+        ));
+    }
+
+    fn remove_current_target(&mut self) {
+        let Some(row) = self.target_rows.get(self.target_cursor).cloned() else {
+            return;
+        };
+        if row.kind != TargetKind::Single {
+            self.toast("select a target (not a group) to remove");
+            return;
+        }
+        let name = row.name.clone();
+        self.cfg.targets.retain(|t| t.name != name);
+        if let Some(dt) = &self.cfg.default_target
+            && dt == &name
+        {
+            self.cfg.default_target = self.cfg.targets.first().map(|t| t.name.clone());
+        }
+        self.rebuild_target_rows();
+        self.persist_config();
+        self.toast(&format!("removed target: {name}"));
+    }
+
+    fn rebuild_target_rows(&mut self) {
+        let mut rows: Vec<TargetRow> = self
+            .cfg
+            .targets
+            .iter()
+            .map(|t| TargetRow {
+                name: t.name.clone(),
+                kind: TargetKind::Single,
+                summary: t.display_endpoint(),
+                selected: self
+                    .cfg
+                    .default_target
+                    .as_deref()
+                    .map(|d| d == t.name)
+                    .unwrap_or(false),
+                status: TargetStatus::Unknown,
+            })
+            .collect();
+        for g in &self.cfg.groups {
+            rows.push(TargetRow {
+                name: g.name.clone(),
+                kind: TargetKind::Group,
+                summary: format!("group → {}", g.targets.join(" + ")),
+                selected: false,
+                status: TargetStatus::Unknown,
+            });
+        }
+        self.target_rows = rows;
+        if self.target_cursor >= self.target_rows.len() {
+            self.target_cursor = self.target_rows.len().saturating_sub(1);
+        }
+    }
+
+    fn persist_config(&mut self) {
+        match crate::config::save_global(&self.cfg) {
+            Ok(path) => {
+                self.toast(&format!(
+                    "saved {}",
+                    path.file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                ));
+            }
+            Err(e) => {
+                self.toast(&format!("save failed: {e}"));
+            }
+        }
+    }
+
+    pub fn picker_move(&mut self, delta: i32) {
+        if let Some(picker) = self.ssh_picker.as_mut() {
+            let n = picker.list.len();
+            if n == 0 {
+                return;
+            }
+            let cur = picker.cursor as i32;
+            picker.cursor = ((cur + delta).rem_euclid(n as i32)) as usize;
         }
     }
 

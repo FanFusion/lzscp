@@ -4,7 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{
     App, Focus, HelpBarAction, HitRegions, ModalHit, TargetKind, TargetStatus, UpdateStatus,
@@ -28,15 +28,19 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     //   Drop zone            (flexible, takes remaining vertical space)
     //   Toast                (1 line)
     //   Help bar             (1 line)
+    // Targets + progress share the top half dynamically; drop zone is a
+    // fixed, smaller strip at the bottom so the rest of the UI gets room to
+    // breathe on tall terminals.
+    let drop_zone_h = 8.min(size.height.saturating_sub(6));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // title
-            Constraint::Length(9), // targets + progress row
-            Constraint::Length(1), // clipboard strip
-            Constraint::Min(8),    // drop zone (fills remaining height)
-            Constraint::Length(1), // toast
-            Constraint::Length(1), // help bar
+            Constraint::Length(1),           // title
+            Constraint::Min(9),              // targets + progress row (grows)
+            Constraint::Length(1),           // clipboard strip
+            Constraint::Length(drop_zone_h), // drop zone (fixed, compact)
+            Constraint::Length(1),           // toast
+            Constraint::Length(1),           // help bar
         ])
         .split(size);
 
@@ -67,6 +71,70 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     if app.menu_visible {
         draw_menu_overlay(f, size, app, &palette);
     }
+    if app.ssh_picker.is_some() {
+        draw_ssh_picker(f, size, app, &palette);
+    }
+}
+
+fn draw_ssh_picker(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
+    let Some(picker) = app.ssh_picker.clone() else {
+        return;
+    };
+    let list_len = picker.list.len();
+    let h = ((list_len as u16) + 4)
+        .min(area.height.saturating_sub(4))
+        .max(6);
+    let w = 72.min(area.width.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+    app.hit_regions.modal_area = Some(rect);
+    app.hit_regions.ssh_picker_rows.clear();
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(""));
+    let max_rows = h.saturating_sub(3) as usize;
+    for (i, host) in picker.list.iter().enumerate().take(max_rows) {
+        let selected = i == picker.cursor;
+        let row_y = rect.y + 1 + (i as u16) + 1;
+        let endpoint = format!(
+            "{}{}{}",
+            host.user.as_deref().unwrap_or(""),
+            if host.user.is_some() { "@" } else { "" },
+            host.hostname.clone().unwrap_or_else(|| host.name.clone()),
+        );
+        let label = Span::styled(
+            format!("  {}. {}", i + 1, host.name),
+            if selected {
+                Style::default()
+                    .fg(p.bg)
+                    .bg(p.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(p.fg)
+            },
+        );
+        let endpoint_span = Span::styled(
+            format!("  {endpoint}"),
+            Style::default().fg(if selected { p.bg } else { p.muted }),
+        );
+        lines.push(Line::from(vec![label, endpoint_span]));
+        app.hit_regions
+            .ssh_picker_rows
+            .push(Rect::new(rect.x + 1, row_y, w.saturating_sub(2), 1));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Enter to add · Esc to cancel",
+        Style::default().fg(p.muted),
+    )));
+
+    let block = Block::default()
+        .title(" Add target from ~/.ssh/config ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(p.bg).fg(p.fg));
+    f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 fn draw_clipboard_strip(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
@@ -464,19 +532,27 @@ fn draw_targets(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette
         .style(Style::default().fg(p.fg).bg(p.bg));
 
     if app.target_rows.is_empty() {
-        let p1 = Paragraph::new(vec![
+        let lines = vec![
             Line::from(""),
             Line::from(Span::styled(
-                "  No SSH hosts found.",
+                "  No targets yet.",
+                Style::default().fg(p.fg).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  1.  Press Ctrl+P (or click ≡ below)",
                 Style::default().fg(p.muted),
             )),
             Line::from(Span::styled(
-                "  Add entries to ~/.ssh/config (Host … HostName … User …)",
+                "  2.  Choose \"Add target from ~/.ssh/config\"",
                 Style::default().fg(p.muted),
             )),
-        ])
-        .block(block);
-        f.render_widget(p1, area);
+            Line::from(Span::styled(
+                "  3.  Pick a host — that's it.",
+                Style::default().fg(p.muted),
+            )),
+        ];
+        f.render_widget(Paragraph::new(lines).block(block), area);
         return;
     }
 
@@ -558,42 +634,120 @@ fn draw_progress(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palett
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let recent = app.transfers.iter().rev().take(4).collect::<Vec<_>>();
-    let n = recent.len();
-    let constraints: Vec<Constraint> = (0..n).map(|_| Constraint::Length(1)).collect();
-    if constraints.is_empty() {
+    // Each transfer takes 2 lines: a caption row with target/file/percent/rate
+    // and a bar row with a clearly visible filled/unfilled gauge.
+    let recent_budget = (inner.height / 2) as usize;
+    let recent: Vec<_> = app
+        .transfers
+        .iter()
+        .rev()
+        .take(recent_budget.max(1))
+        .collect();
+    if recent.is_empty() {
         return;
     }
-    let rows = Layout::default()
+
+    let row_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(constraints)
+        .constraints(vec![Constraint::Length(2); recent.len()])
         .split(inner);
 
     for (i, t) in recent.iter().enumerate() {
-        let label = format!(
-            "{}  {}  {}",
-            t.target_name,
-            t.local
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            t.rate
-        );
+        let slot = row_chunks[i];
+        if slot.height < 2 {
+            continue;
+        }
+        let caption_area = Rect::new(slot.x, slot.y, slot.width, 1);
+        let bar_area = Rect::new(slot.x, slot.y + 1, slot.width, 1);
+
         let color = match t.state {
             TransferState::Completed => p.diff_add,
             TransferState::Failed => p.diff_del,
             TransferState::Running => p.accent,
             TransferState::Pending => p.muted,
         };
-        let gauge = Gauge::default()
-            .gauge_style(Style::default().fg(color).bg(p.bg))
-            .ratio(t.percent as f64 / 100.0)
-            .label(Span::styled(
-                label,
-                Style::default().fg(p.fg).add_modifier(Modifier::BOLD),
-            ));
-        f.render_widget(gauge, rows[i]);
+        let (icon, icon_style) = match t.state {
+            TransferState::Completed => (
+                "✓",
+                Style::default().fg(p.diff_add).add_modifier(Modifier::BOLD),
+            ),
+            TransferState::Failed => (
+                "✗",
+                Style::default().fg(p.diff_del).add_modifier(Modifier::BOLD),
+            ),
+            TransferState::Running => ("●", Style::default().fg(p.accent)),
+            TransferState::Pending => ("·", Style::default().fg(p.muted)),
+        };
+
+        let filename = t
+            .local
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // Allow up to ~60% of the panel width for the filename so the rate
+        // column always fits.
+        let fname_budget = (slot.width as usize).saturating_sub(28);
+        let filename_short = truncate_middle(&filename, fname_budget.max(10));
+
+        let percent = t.percent.min(100);
+        let rate_text = if t.rate.is_empty() || percent == 100 {
+            String::new()
+        } else {
+            format!(" {}", t.rate)
+        };
+        let pct_text = format!(" {percent:>3}%");
+
+        let caption = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(icon, icon_style),
+            Span::raw(" "),
+            Span::styled(
+                t.target_name.clone(),
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(filename_short, Style::default().fg(p.fg)),
+            Span::raw("  "),
+            Span::styled(pct_text, Style::default().fg(color)),
+            Span::styled(rate_text, Style::default().fg(p.muted)),
+        ]);
+        f.render_widget(
+            Paragraph::new(caption).style(Style::default().bg(p.bg)),
+            caption_area,
+        );
+
+        draw_bar(f, bar_area, percent, color, p);
     }
+}
+
+/// Render a solid progress bar row with a clearly visible unfilled track.
+fn draw_bar(
+    f: &mut Frame<'_>,
+    area: Rect,
+    percent: u8,
+    fill: ratatui::style::Color,
+    p: &theme::Palette,
+) {
+    let width = area.width as usize;
+    if width == 0 {
+        return;
+    }
+    let filled = (width as u32 * percent.min(100) as u32 / 100) as usize;
+    let unfilled = width.saturating_sub(filled);
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(2);
+    if filled > 0 {
+        spans.push(Span::styled("█".repeat(filled), Style::default().fg(fill)));
+    }
+    if unfilled > 0 {
+        spans.push(Span::styled(
+            "─".repeat(unfilled),
+            Style::default().fg(p.muted),
+        ));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(p.bg)),
+        area,
+    );
 }
 
 fn draw_help_bar(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
