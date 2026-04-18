@@ -4,7 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{
     App, Focus, HelpBarAction, HitRegions, ModalHit, TargetKind, TargetStatus, UpdateStatus,
@@ -129,6 +129,7 @@ fn draw_ssh_picker(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Pale
         Style::default().fg(p.muted),
     )));
 
+    f.render_widget(Clear, rect);
     let block = Block::default()
         .title(" Add target from ~/.ssh/config ")
         .borders(Borders::ALL)
@@ -229,6 +230,7 @@ fn draw_menu_overlay(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Pa
         ));
     }
 
+    f.render_widget(Clear, rect);
     let block = Block::default()
         .title(" Menu  (Ctrl+P) ")
         .borders(Borders::ALL)
@@ -363,6 +365,7 @@ fn draw_update_overlay(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::
         UpdateStatus::Failed(_) => p.diff_del,
         _ => p.accent,
     };
+    f.render_widget(Clear, rect);
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -440,9 +443,19 @@ fn draw_drop_zone(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palet
         .style(Style::default().fg(p.fg).bg(p.bg));
 
     if app.queue.is_empty() {
-        // Big inviting hint, roughly vertically centred.
         let inner_h = area.height.saturating_sub(2);
-        let pad_top = (inner_h.saturating_sub(4) / 2) as usize;
+        let selected_targets: Vec<&str> = app
+            .target_rows
+            .iter()
+            .filter(|r| r.selected)
+            .map(|r| r.name.as_str())
+            .collect();
+
+        // Reserve 2 rows for the "will send to…" footer so the hint still
+        // centres visually.
+        let content_lines = if selected_targets.is_empty() { 4 } else { 6 };
+        let pad_top = (inner_h.saturating_sub(content_lines) / 2) as usize;
+
         let mut hint: Vec<Line> = Vec::new();
         for _ in 0..pad_top {
             hint.push(Line::from(""));
@@ -461,14 +474,28 @@ fn draw_drop_zone(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palet
                 Style::default().fg(p.fg),
             )],
         ));
-        hint.push(Line::from(""));
-        hint.push(center_line(
-            area.width,
-            vec![Span::styled(
-                "supports spaces · 中文 · emoji",
-                Style::default().fg(p.muted),
-            )],
-        ));
+        if !selected_targets.is_empty() {
+            hint.push(Line::from(""));
+            hint.push(center_line(
+                area.width,
+                vec![
+                    Span::styled("→ will send to: ", Style::default().fg(p.muted)),
+                    Span::styled(
+                        selected_targets.join(", "),
+                        Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+                    ),
+                ],
+            ));
+        } else {
+            hint.push(Line::from(""));
+            hint.push(center_line(
+                area.width,
+                vec![Span::styled(
+                    "(select a target above first)",
+                    Style::default().fg(p.diff_del),
+                )],
+            ));
+        }
         if let Some(err) = &app.last_paste_error {
             hint.push(Line::from(""));
             hint.push(center_line(
@@ -796,18 +823,20 @@ fn draw_help_bar(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palett
 }
 
 fn draw_help_overlay(f: &mut Frame<'_>, area: Rect, p: &theme::Palette) {
-    let w = 60.min(area.width.saturating_sub(4));
-    let h = 18.min(area.height.saturating_sub(4));
+    let w = 62.min(area.width.saturating_sub(4));
+    let h = 20.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect::new(x, y, w, h);
 
+    f.render_widget(Clear, rect);
     let block = Block::default()
         .title(" Help ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.accent))
         .style(Style::default().bg(p.bg).fg(p.fg));
     let lines = vec![
+        Line::from("  Ctrl+P             open menu / command palette"),
         Line::from("  Tab / Shift+Tab    cycle focus"),
         Line::from("  Up / Down          move cursor"),
         Line::from("  Space              toggle selected target"),
@@ -815,6 +844,7 @@ fn draw_help_overlay(f: &mut Frame<'_>, area: Rect, p: &theme::Palette) {
         Line::from("  Enter              execute sync (manual)"),
         Line::from("  a / m              auto / manual mode"),
         Line::from("  c                  cycle clipboard format"),
+        Line::from("  t                  cycle theme"),
         Line::from("  u                  check for update"),
         Line::from("  Backspace          remove queued file under cursor"),
         Line::from("  x                  clear queue"),
@@ -880,13 +910,41 @@ fn status_display(status: &TargetStatus, p: &theme::Palette) -> (String, Style, 
         TargetStatus::Unreachable(e) => (
             "[✗]".to_string(),
             Style::default().fg(p.diff_del),
-            first_line(e).to_string(),
+            summarize_ssh_error(e),
         ),
     }
 }
 
-fn first_line(s: &str) -> &str {
-    s.lines().next().unwrap_or("")
+fn summarize_ssh_error(e: &str) -> String {
+    let first = e.lines().next().unwrap_or("").trim();
+    // Collapse common failure modes into short human labels.
+    if first.contains("Invalid command") {
+        return "not a shell host (ssh rejects cmd)".to_string();
+    }
+    if first.contains("Connection closed") {
+        return "connection closed".to_string();
+    }
+    if first.contains("Connection timed out") || first.contains("ConnectTimeout") {
+        return "timed out".to_string();
+    }
+    if first.contains("Permission denied") {
+        return "auth denied — add key to ssh-agent".to_string();
+    }
+    if first.contains("Could not resolve hostname") {
+        return "hostname not resolvable".to_string();
+    }
+    if first.contains("Host key verification failed") {
+        return "host key failed — accept in ssh first".to_string();
+    }
+    if first.contains("No route to host") {
+        return "no route to host".to_string();
+    }
+    // Fall back to the first ~48 chars.
+    let mut cut: String = first.chars().take(48).collect();
+    if first.chars().count() > 48 {
+        cut.push('…');
+    }
+    cut
 }
 
 fn truncate_middle(s: &str, max: usize) -> String {

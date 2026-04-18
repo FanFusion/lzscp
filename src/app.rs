@@ -486,22 +486,30 @@ impl App {
             }
         }
 
-        // Target row click → focus targets + toggle that row. If the target
-        // is in NoRsync state, clicking triggers the auto-install flow
-        // instead of toggling selection.
+        // Target row click → focus targets. Behaviour depends on status:
+        //   [⚠] NoRsync     → trigger auto-install
+        //   [✗] Unreachable → toast the full ssh error so user can diagnose
+        //   otherwise       → toggle selection
         for (i, r) in self.hit_regions.target_rows.clone().iter().enumerate() {
             if rect_contains(*r, x, y) {
                 self.focus = Focus::Targets;
-                if let Some(row) = self.target_rows.get(i)
-                    && row.status == TargetStatus::NoRsync
-                {
-                    let name = row.name.clone();
-                    self.target_cursor = i;
-                    self.start_remote_rsync_install(&name);
-                    return;
+                self.target_cursor = i;
+                if let Some(row) = self.target_rows.get(i) {
+                    match &row.status {
+                        TargetStatus::NoRsync => {
+                            let name = row.name.clone();
+                            self.start_remote_rsync_install(&name);
+                            return;
+                        }
+                        TargetStatus::Unreachable(e) => {
+                            let msg = e.lines().next().unwrap_or("").trim().to_string();
+                            self.toast(&msg);
+                            return;
+                        }
+                        _ => {}
+                    }
                 }
                 if i < self.target_rows.len() {
-                    self.target_cursor = i;
                     self.toggle_target_cursor();
                 }
                 return;
