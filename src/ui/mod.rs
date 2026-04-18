@@ -17,37 +17,154 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     // Reset hit-test regions for this frame.
     app.hit_regions = HitRegions::default();
 
+    // New ergonomic layout (Mac dock is at the bottom → drag motion goes
+    // upward from the bottom edge of the terminal, so Drop zone lives there).
+    //
+    //   Title
+    //   Targets │ Progress   (50/50 split, fixed 9 lines)
+    //   Clipboard strip      (1 line — the primary output of the app)
+    //   Drop zone            (flexible, takes remaining vertical space)
+    //   Toast                (1 line)
+    //   Help bar             (1 line)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // title bar
-            Constraint::Length(7), // drop zone
-            Constraint::Min(6),    // targets
-            Constraint::Length(8), // progress
-            Constraint::Length(2), // clipboard + toast
-            Constraint::Length(1), // help
+            Constraint::Length(1), // title
+            Constraint::Length(9), // targets + progress row
+            Constraint::Length(1), // clipboard strip
+            Constraint::Min(8),    // drop zone (fills remaining height)
+            Constraint::Length(1), // toast
+            Constraint::Length(1), // help bar
         ])
         .split(size);
 
-    app.hit_regions.drop_zone = chunks[1];
-    app.hit_regions.targets_panel = chunks[2];
-    app.hit_regions.progress_panel = chunks[3];
+    let tp_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[1]);
+
+    app.hit_regions.targets_panel = tp_row[0];
+    app.hit_regions.progress_panel = tp_row[1];
+    app.hit_regions.drop_zone = chunks[3];
 
     draw_title(f, chunks[0], app, &palette);
-    draw_drop_zone(f, chunks[1], app, &palette);
-    draw_targets(f, chunks[2], app, &palette);
-    draw_progress(f, chunks[3], app, &palette);
-    draw_status(f, chunks[4], app, &palette);
+    draw_targets(f, tp_row[0], app, &palette);
+    draw_progress(f, tp_row[1], app, &palette);
+    draw_clipboard_strip(f, chunks[2], app, &palette);
+    draw_drop_zone(f, chunks[3], app, &palette);
+    draw_toast(f, chunks[4], app, &palette);
     draw_help_bar(f, chunks[5], app, &palette);
 
     if app.help_visible {
         draw_help_overlay(f, size, &palette);
-        // Help overlay consumes its own rect for click dismissal.
         app.hit_regions.modal_area = Some(size);
     }
     if !matches!(app.update_status, UpdateStatus::Idle) {
         draw_update_overlay(f, size, app, &palette);
     }
+    if app.menu_visible {
+        draw_menu_overlay(f, size, app, &palette);
+    }
+}
+
+fn draw_clipboard_strip(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
+    let line = match &app.last_clipboard {
+        Some(v) => Line::from(vec![
+            Span::styled(
+                " ✓ clipboard ",
+                Style::default()
+                    .fg(p.bg)
+                    .bg(p.diff_add)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                truncate_middle(v, area.width.saturating_sub(14) as usize),
+                Style::default().fg(p.accent),
+            ),
+        ]),
+        None => Line::from(vec![
+            Span::styled(
+                " clipboard ",
+                Style::default().fg(p.muted).add_modifier(Modifier::DIM),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                "(drop a file and the remote path lands here)",
+                Style::default().fg(p.muted),
+            ),
+        ]),
+    };
+    f.render_widget(
+        Paragraph::new(line).style(Style::default().bg(p.bg).fg(p.fg)),
+        area,
+    );
+}
+
+fn draw_toast(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
+    let line = match &app.toast {
+        Some((s, _)) => Line::from(Span::styled(
+            format!(" • {s}"),
+            Style::default().fg(p.diff_add),
+        )),
+        None => Line::from(""),
+    };
+    f.render_widget(Paragraph::new(line).style(Style::default().bg(p.bg)), area);
+}
+
+fn draw_menu_overlay(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
+    let actions = crate::app::MenuAction::all();
+    let h = (actions.len() as u16 + 4).min(area.height.saturating_sub(4));
+    let w = 48.min(area.width.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+    app.hit_regions.modal_area = Some(rect);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(""));
+    for (i, action) in actions.iter().enumerate() {
+        let selected = i == app.menu_cursor;
+        let row_y = rect.y + 1 + (i as u16) + 1;
+        let label_span = Span::styled(
+            format!("  {}. {}", i + 1, action.label()),
+            if selected {
+                Style::default()
+                    .fg(p.bg)
+                    .bg(p.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(p.fg)
+            },
+        );
+        let kb = Span::styled(
+            format!("  [{}]", action.shortcut()),
+            Style::default().fg(if selected { p.bg } else { p.muted }),
+        );
+        let mut row_spans = vec![label_span];
+        let pad_w = w.saturating_sub(2) as i32
+            - (2 + 3
+                + action.label().chars().count() as i32
+                + 4
+                + action.shortcut().chars().count() as i32);
+        if pad_w > 0 {
+            row_spans.push(Span::raw(" ".repeat(pad_w as usize)));
+        }
+        row_spans.push(kb);
+        lines.push(Line::from(row_spans));
+
+        app.hit_regions.menu_rows.push((
+            Rect::new(rect.x + 1, row_y, w.saturating_sub(2), 1),
+            *action,
+        ));
+    }
+
+    let block = Block::default()
+        .title(" Menu  (Ctrl+P) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(p.bg).fg(p.fg));
+    f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 fn draw_update_overlay(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
@@ -253,20 +370,45 @@ fn draw_drop_zone(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palet
         .style(Style::default().fg(p.fg).bg(p.bg));
 
     if app.queue.is_empty() {
-        let hint = vec![
-            Line::from(Span::styled(
-                "  ⬇  拖入文件 / Cmd+V 粘贴路径  (支持空格和中文)",
+        // Big inviting hint, roughly vertically centred.
+        let inner_h = area.height.saturating_sub(2);
+        let pad_top = (inner_h.saturating_sub(4) / 2) as usize;
+        let mut hint: Vec<Line> = Vec::new();
+        for _ in 0..pad_top {
+            hint.push(Line::from(""));
+        }
+        hint.push(center_line(
+            area.width,
+            vec![Span::styled(
+                "⬇  Drop files here",
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            )],
+        ));
+        hint.push(center_line(
+            area.width,
+            vec![Span::styled(
+                "or Cmd+V / Ctrl+Shift+V paste paths",
+                Style::default().fg(p.fg),
+            )],
+        ));
+        hint.push(Line::from(""));
+        hint.push(center_line(
+            area.width,
+            vec![Span::styled(
+                "supports spaces · 中文 · emoji",
                 Style::default().fg(p.muted),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                app.last_paste_error
-                    .as_deref()
-                    .map(|e| format!("  ⚠ {e}"))
-                    .unwrap_or_default(),
-                Style::default().fg(p.diff_del),
-            )),
-        ];
+            )],
+        ));
+        if let Some(err) = &app.last_paste_error {
+            hint.push(Line::from(""));
+            hint.push(center_line(
+                area.width,
+                vec![Span::styled(
+                    format!("⚠ {err}"),
+                    Style::default().fg(p.diff_del),
+                )],
+            ));
+        }
         f.render_widget(
             Paragraph::new(hint).block(block).wrap(Wrap { trim: false }),
             area,
@@ -440,52 +582,14 @@ fn draw_progress(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palett
     }
 }
 
-fn draw_status(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
-        .split(area);
-
-    let clipboard_line = match &app.last_clipboard {
-        Some(v) => Line::from(vec![
-            Span::styled(" clipboard: ", Style::default().fg(p.muted)),
-            Span::styled(
-                truncate_middle(v, area.width.saturating_sub(14) as usize),
-                Style::default().fg(p.accent),
-            ),
-        ]),
-        None => Line::from(Span::styled(
-            " clipboard: (will populate after first successful transfer)",
-            Style::default().fg(p.muted),
-        )),
-    };
-    f.render_widget(
-        Paragraph::new(clipboard_line).style(Style::default().bg(p.bg)),
-        chunks[0],
-    );
-
-    let toast_line = match &app.toast {
-        Some((s, _)) => Line::from(Span::styled(
-            format!(" • {s}"),
-            Style::default().fg(p.diff_add),
-        )),
-        None => Line::from(""),
-    };
-    f.render_widget(
-        Paragraph::new(toast_line).style(Style::default().bg(p.bg)),
-        chunks[1],
-    );
-}
-
 fn draw_help_bar(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
-    // (key-label, description, click action)
-    let chips: [(&str, &str, HelpBarAction); 8] = [
+    // (key-label, description, click action). ≡ opens the menu which contains
+    // every less-common action, so we keep the bar short.
+    let chips: [(&str, &str, HelpBarAction); 6] = [
         ("Tab", "focus", HelpBarAction::CycleFocus),
-        ("Space", "toggle", HelpBarAction::ToggleSelection),
         ("Enter", "sync", HelpBarAction::Sync),
-        ("a/m", "mode", HelpBarAction::CycleMode),
-        ("c", "clip-fmt", HelpBarAction::CycleClipboard),
         ("u", "update", HelpBarAction::CheckUpdate),
+        ("≡", "menu", HelpBarAction::OpenMenu),
         ("?", "help", HelpBarAction::ToggleHelp),
         ("q", "quit", HelpBarAction::Quit),
     ];
@@ -593,4 +697,26 @@ fn truncate_middle(s: &str, max: usize) -> String {
     let head: String = chars.iter().take(half).collect();
     let tail: String = chars.iter().skip(total - half).collect();
     format!("{head}…{tail}")
+}
+
+fn center_line<'a>(width: u16, inner: Vec<Span<'a>>) -> Line<'a> {
+    let content_w: usize = inner
+        .iter()
+        .map(|s| unicode_width_str(s.content.as_ref()))
+        .sum();
+    let inner_area_w = width.saturating_sub(2) as usize; // account for borders
+    let left = inner_area_w.saturating_sub(content_w) / 2;
+    let mut spans: Vec<Span<'a>> = Vec::with_capacity(inner.len() + 1);
+    if left > 0 {
+        spans.push(Span::raw(" ".repeat(left)));
+    }
+    spans.extend(inner);
+    Line::from(spans)
+}
+
+fn unicode_width_str(s: &str) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    s.chars()
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum()
 }

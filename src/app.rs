@@ -39,6 +39,7 @@ pub enum Focus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // some actions are available via menu only, not the help bar
 pub enum HelpBarAction {
     CycleFocus,
     ToggleSelection,
@@ -47,7 +48,57 @@ pub enum HelpBarAction {
     CycleClipboard,
     CheckUpdate,
     ToggleHelp,
+    OpenMenu,
     Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuAction {
+    CheckUpdate,
+    ToggleMode,
+    CycleClipboardFormat,
+    CycleTheme,
+    ClearQueue,
+    Help,
+    Quit,
+}
+
+impl MenuAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            MenuAction::CheckUpdate => "Check for update",
+            MenuAction::ToggleMode => "Toggle auto / manual mode",
+            MenuAction::CycleClipboardFormat => "Cycle clipboard format",
+            MenuAction::CycleTheme => "Cycle theme",
+            MenuAction::ClearQueue => "Clear queue",
+            MenuAction::Help => "Show help",
+            MenuAction::Quit => "Quit",
+        }
+    }
+
+    pub fn shortcut(self) -> &'static str {
+        match self {
+            MenuAction::CheckUpdate => "u",
+            MenuAction::ToggleMode => "a/m",
+            MenuAction::CycleClipboardFormat => "c",
+            MenuAction::CycleTheme => "t",
+            MenuAction::ClearQueue => "x",
+            MenuAction::Help => "?",
+            MenuAction::Quit => "q",
+        }
+    }
+
+    pub fn all() -> &'static [MenuAction] {
+        &[
+            MenuAction::CheckUpdate,
+            MenuAction::ToggleMode,
+            MenuAction::CycleClipboardFormat,
+            MenuAction::CycleTheme,
+            MenuAction::ClearQueue,
+            MenuAction::Help,
+            MenuAction::Quit,
+        ]
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +118,7 @@ pub struct HitRegions {
     pub help_bar_hits: Vec<(Rect, HelpBarAction)>,
     pub modal_area: Option<Rect>,
     pub modal_hits: Vec<(Rect, ModalHit)>,
+    pub menu_rows: Vec<(Rect, MenuAction)>,
 }
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
@@ -108,6 +160,8 @@ pub struct App {
     pub last_clipboard: Option<String>,
     pub toast: Option<(String, std::time::Instant)>,
     pub help_visible: bool,
+    pub menu_visible: bool,
+    pub menu_cursor: usize,
 
     pub update_status: UpdateStatus,
     pub hit_regions: HitRegions,
@@ -170,6 +224,8 @@ impl App {
             last_clipboard: None,
             toast: None,
             help_visible: false,
+            menu_visible: false,
+            menu_cursor: 0,
             update_status: UpdateStatus::Idle,
             hit_regions: HitRegions::default(),
             transfer_tx: tx,
@@ -209,6 +265,20 @@ impl App {
     }
 
     fn handle_click(&mut self, x: u16, y: u16) {
+        // Menu takes precedence (it's drawn on top of everything else).
+        if self.menu_visible {
+            for (r, action) in self.hit_regions.menu_rows.clone() {
+                if rect_contains(r, x, y) {
+                    self.menu_visible = false;
+                    self.run_menu_action(action);
+                    return;
+                }
+            }
+            // Click outside menu rows → dismiss.
+            self.menu_visible = false;
+            return;
+        }
+
         // Modal takes precedence.
         if let Some(modal) = self.hit_regions.modal_area
             && rect_contains(modal, x, y)
@@ -306,6 +376,10 @@ impl App {
             HelpBarAction::CycleClipboard => self.cycle_clipboard_format(),
             HelpBarAction::CheckUpdate => self.start_update_check(),
             HelpBarAction::ToggleHelp => self.help_visible = !self.help_visible,
+            HelpBarAction::OpenMenu => {
+                self.menu_visible = true;
+                self.menu_cursor = 0;
+            }
             HelpBarAction::Quit => self.should_quit = true,
         }
     }
@@ -343,6 +417,36 @@ impl App {
             self.update_status = UpdateStatus::Idle;
             return;
         }
+        if self.menu_visible {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.menu_visible = false;
+                }
+                KeyCode::Up => {
+                    let n = MenuAction::all().len();
+                    self.menu_cursor = (self.menu_cursor + n - 1) % n;
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    let n = MenuAction::all().len();
+                    self.menu_cursor = (self.menu_cursor + 1) % n;
+                }
+                KeyCode::Enter => {
+                    let action = MenuAction::all()[self.menu_cursor];
+                    self.menu_visible = false;
+                    self.run_menu_action(action);
+                }
+                KeyCode::Char(d @ '1'..='9') => {
+                    let idx = (d as u8 - b'1') as usize;
+                    if idx < MenuAction::all().len() {
+                        let action = MenuAction::all()[idx];
+                        self.menu_visible = false;
+                        self.run_menu_action(action);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.help_visible {
             self.help_visible = false;
             return;
@@ -351,6 +455,11 @@ impl App {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.help_visible = true,
             KeyCode::Char('u') => self.start_update_check(),
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.menu_visible = true;
+                self.menu_cursor = 0;
+            }
+            KeyCode::Char('t') => self.cycle_theme(),
             KeyCode::Tab => self.cycle_focus(1),
             KeyCode::BackTab => self.cycle_focus(-1),
             KeyCode::Char('a') => {
@@ -386,6 +495,40 @@ impl App {
                 self.queue_cursor = 0;
             }
             _ => {}
+        }
+    }
+
+    fn cycle_theme(&mut self) {
+        let themes = ["mocha", "tokyo_night", "gruvbox", "nord", "dracula"];
+        let cur = themes
+            .iter()
+            .position(|t| *t == self.cfg.theme)
+            .unwrap_or(0);
+        let next = (cur + 1) % themes.len();
+        self.cfg.theme = themes[next].to_string();
+        self.toast(&format!("theme: {}", themes[next]));
+    }
+
+    fn run_menu_action(&mut self, a: MenuAction) {
+        match a {
+            MenuAction::CheckUpdate => self.start_update_check(),
+            MenuAction::ToggleMode => {
+                self.mode = match self.mode {
+                    SyncMode::Auto => SyncMode::Manual,
+                    SyncMode::Manual => SyncMode::Auto,
+                };
+                self.toast(&format!("mode: {:?}", self.mode).to_lowercase());
+            }
+            MenuAction::CycleClipboardFormat => self.cycle_clipboard_format(),
+            MenuAction::CycleTheme => self.cycle_theme(),
+            MenuAction::ClearQueue => {
+                let n = self.queue.len();
+                self.queue.clear();
+                self.queue_cursor = 0;
+                self.toast(&format!("cleared {n} queued"));
+            }
+            MenuAction::Help => self.help_visible = true,
+            MenuAction::Quit => self.should_quit = true,
         }
     }
 
