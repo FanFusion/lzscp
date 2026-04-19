@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::target::{ClipboardFormat, Group, SyncMode, Target};
+use crate::target::{ClipboardFormat, Group, SyncMode, Target, WatchConfig};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
@@ -21,8 +21,14 @@ pub struct Config {
     pub targets: Vec<Target>,
     #[serde(default, rename = "group")]
     pub groups: Vec<Group>,
+    #[serde(default, rename = "watch")]
+    pub watches: Vec<WatchConfig>,
     #[serde(skip)]
     pub source: ConfigSource,
+    /// Non-persisted notice shown to the user via a toast on first launch
+    /// after upgrading from lzscp to lzsync.
+    #[serde(skip)]
+    pub migration_notice: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -47,7 +53,9 @@ impl Default for Config {
             theme: "mocha".to_string(),
             targets: vec![],
             groups: vec![],
+            watches: vec![],
             source: ConfigSource::Default,
+            migration_notice: None,
         }
     }
 }
@@ -71,6 +79,10 @@ impl Config {
 }
 
 pub fn load() -> Result<Config> {
+    // Must run before the global read below — if the user is upgrading from
+    // lzscp the new global dir doesn't exist yet.
+    let notice = migrate_legacy_config().unwrap_or_else(|e| Some(format!("migration failed: {e}")));
+
     let project = project_config_path();
     let global = global_config_path();
 
@@ -92,6 +104,7 @@ pub fn load() -> Result<Config> {
     {
         cfg.default_target = Some(first.name.clone());
     }
+    cfg.migration_notice = notice;
     Ok(cfg)
 }
 
@@ -101,7 +114,7 @@ pub fn target_from_ssh_host(h: crate::ssh_config::SshHost) -> Target {
         name: h.name.clone(),
         host: h.hostname.unwrap_or(h.name),
         user: h.user,
-        remote_dir: "~/lzscp-inbox".to_string(),
+        remote_dir: "~/lzsync-inbox".to_string(),
         ssh_port: h.port,
         ssh_key: h.identity_file,
         clipboard_format: None,
@@ -176,17 +189,89 @@ fn validate(cfg: &Config) -> Result<()> {
             dt
         );
     }
+    let mut watch_names = HashSet::new();
+    for w in &cfg.watches {
+        anyhow::ensure!(!w.name.is_empty(), "watch name must not be empty");
+        anyhow::ensure!(!w.path.is_empty(), "watch '{}' missing path", w.name);
+        anyhow::ensure!(
+            !w.targets.is_empty(),
+            "watch '{}' must reference at least one target",
+            w.name
+        );
+        anyhow::ensure!(
+            watch_names.insert(w.name.clone()),
+            "duplicate watch name: {}",
+            w.name
+        );
+        for tn in &w.targets {
+            anyhow::ensure!(
+                cfg.targets.iter().any(|t| &t.name == tn) || cfg.group_by_name(tn).is_some(),
+                "watch '{}' references unknown target '{}'",
+                w.name,
+                tn
+            );
+        }
+    }
     Ok(())
 }
 
 pub fn project_config_path() -> Option<PathBuf> {
     std::env::current_dir()
         .ok()
-        .map(|cwd| cwd.join(".lzscp/config.toml"))
+        .map(|cwd| cwd.join(".lzsync/config.toml"))
 }
 
 pub fn global_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("lzscp/config.toml"))
+    dirs::config_dir().map(|d| d.join("lzsync/config.toml"))
+}
+
+/// Pre-0.4.0 global config lived under `~/.config/lzscp/` (when the binary was
+/// named lzscp). Returned so we can migrate legacy configs on startup.
+pub fn legacy_global_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("lzscp"))
+}
+
+pub fn current_global_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("lzsync"))
+}
+
+/// If the user is upgrading from lzscp (<0.4.0), their config and history live
+/// under `~/.config/lzscp/`. On first launch under lzsync we recursively copy
+/// that directory into `~/.config/lzsync/` so they don't lose their targets or
+/// transfer history. The old directory is left in place as a backup. The copy
+/// is a no-op when the new directory already exists or the old one doesn't.
+/// Returns Ok(Some(message)) on a successful migration, Ok(None) if nothing to
+/// do.
+pub fn migrate_legacy_config() -> Result<Option<String>> {
+    let (Some(new_dir), Some(old_dir)) = (current_global_dir(), legacy_global_dir()) else {
+        return Ok(None);
+    };
+    if new_dir.exists() || !old_dir.exists() {
+        return Ok(None);
+    }
+    copy_dir_all(&old_dir, &new_dir)
+        .with_context(|| format!("migrate {old_dir:?} -> {new_dir:?}"))?;
+    Ok(Some(format!(
+        "migrated config from {} (backup kept)",
+        old_dir.display()
+    )))
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_all(&from, &to)?;
+        } else if file_type.is_file() {
+            std::fs::copy(&from, &to)?;
+        }
+        // Symlinks are skipped; lzsync config shouldn't contain any.
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -321,6 +406,42 @@ clipboard_format = "scp_style"
 }
 
 #[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn copy_dir_all_recursively_copies_nested_files() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("config.toml"), "hello").unwrap();
+        std::fs::write(src.join("sub/history.jsonl"), "world").unwrap();
+
+        copy_dir_all(&src, &dst).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dst.join("config.toml")).unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("sub/history.jsonl")).unwrap(),
+            "world"
+        );
+        // Source preserved.
+        assert!(src.join("config.toml").exists());
+    }
+
+    #[test]
+    fn copy_dir_all_errors_on_missing_source() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("missing");
+        let dst = tmp.path().join("dst");
+        assert!(copy_dir_all(&src, &dst).is_err());
+    }
+}
+
+#[cfg(test)]
 mod round_trip_tests {
     use super::*;
     use crate::target::Target;
@@ -339,7 +460,7 @@ mod round_trip_tests {
             name: "devjp".into(),
             host: "1.2.3.4".into(),
             user: Some("ubuntu".into()),
-            remote_dir: "~/lzscp-inbox".into(),
+            remote_dir: "~/lzsync-inbox".into(),
             ssh_port: Some(22),
             ssh_key: Some("~/.ssh/id_ed25519".into()),
             clipboard_format: None,

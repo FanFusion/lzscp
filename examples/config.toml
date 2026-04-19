@@ -1,8 +1,8 @@
-# lzscp config.toml example
+# lzsync config.toml example
 #
 # Place this file at one of:
-#   - $PWD/.lzscp/config.toml              (per-project, loaded first)
-#   - $XDG_CONFIG_HOME/lzscp/config.toml   (global fallback)
+#   - $PWD/.lzsync/config.toml              (per-project, loaded first)
+#   - $XDG_CONFIG_HOME/lzsync/config.toml   (global fallback)
 
 # Target selected automatically on startup. Omit to auto-select the first target.
 default_target = "dev"
@@ -47,3 +47,21 @@ remote_dir  = "/tmp/uploads"
 name     = "all-dev"
 targets  = ["dev", "staging"]
 primary  = "dev"
+
+# --- Folder watches (v0.4.0+) ----------------------------------------------
+# A watch monitors a directory and auto-syncs any new file matching `patterns`
+# to `targets`. Useful for screenshot folders: take a screenshot → the remote
+# path is on your clipboard ~2s later, no drag-drop needed.
+#
+# Each watch has its own lock; two lzsync instances can watch different
+# folders, but only one can watch a given folder at a time.
+
+# [[watch]]
+# name        = "screenshots"
+# path        = "~/Desktop"
+# targets     = ["dev"]
+# patterns    = ["*.png", "*.jpg", "*.jpeg", "*.heic", "*.webp"]
+# catchup     = "prompt"   # prompt | auto | ignore  — how to handle files added while lzsync was off
+# enabled     = false      # try to acquire the watch lock on launch
+# debounce_ms = 500        # wait this long after a new file appears before sending it
+# recursive   = false      # watch subdirectories too

@@ -48,6 +48,9 @@ pub struct Transfer {
     pub rate: String,
     pub state: TransferState,
     pub last_error: Option<String>,
+    /// Set to `Some(watch_name)` for transfers that originated from a folder
+    /// watch (rendered with a 📸 prefix). `None` for manual drop/paste.
+    pub source_watch: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +72,14 @@ impl Transfer {
             rate: String::new(),
             state: TransferState::Pending,
             last_error: None,
+            source_watch: None,
         }
+    }
+
+    pub fn new_from_watch(id: u64, target: &Target, local: PathBuf, watch_name: String) -> Self {
+        let mut t = Self::new(id, target, local);
+        t.source_watch = Some(watch_name);
+        t
     }
 }
 

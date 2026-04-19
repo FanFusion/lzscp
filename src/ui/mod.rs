@@ -7,8 +7,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{
-    ActivityRef, App, Focus, HelpBarAction, HitRegions, ModalHit, TargetKind, TargetStatus,
-    UpdateStatus,
+    ActivityRef, App, Focus, HelpBarAction, HitRegions, ModalHit, Tab, TargetKind, TargetStatus,
+    UpdateStatus, WatchUi, WatchUiStatus,
 };
 use crate::history::HistoryEntry;
 use crate::target::SyncMode;
@@ -21,42 +21,29 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     // Reset hit-test regions for this frame.
     app.hit_regions = HitRegions::default();
 
-    // Layout:
-    //   Title                (1 line)
-    //   Targets │ Activity   (grow, 50/50 split)
-    //   Drop zone            (fixed 8 lines, at the bottom where Mac dock is)
-    //   Toast                (1 line — the sole clipboard/status feedback)
-    //   Help bar             (1 line)
-    //
-    // The old top "clipboard strip" was removed because the toast right above
-    // the help bar already shows the last clipboard write.
-    let drop_zone_h = 8.min(size.height.saturating_sub(5));
-    let chunks = Layout::default()
+    // Every tab shares the two-line header (title + tab bar), a toast line
+    // and the help bar. Only the body in between differs.
+    let body_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),           // title
-            Constraint::Min(9),              // targets + activity row (grows)
-            Constraint::Length(drop_zone_h), // drop zone (fixed, compact)
-            Constraint::Length(1),           // toast
-            Constraint::Length(1),           // help bar
+            Constraint::Length(1), // title
+            Constraint::Length(1), // tab bar
+            Constraint::Min(6),    // body (tab-specific)
+            Constraint::Length(1), // toast
+            Constraint::Length(1), // help bar
         ])
         .split(size);
 
-    let tp_row = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[1]);
+    draw_title(f, body_chunks[0], app, &palette);
+    draw_tab_bar(f, body_chunks[1], app, &palette);
 
-    app.hit_regions.targets_panel = tp_row[0];
-    app.hit_regions.progress_panel = tp_row[1];
-    app.hit_regions.drop_zone = chunks[2];
+    match app.current_tab {
+        Tab::Drop => draw_drop_tab_body(f, body_chunks[2], app, &palette),
+        Tab::Watch => draw_watch_tab_body(f, body_chunks[2], app, &palette),
+    }
 
-    draw_title(f, chunks[0], app, &palette);
-    draw_targets(f, tp_row[0], app, &palette);
-    draw_activity(f, tp_row[1], app, &palette);
-    draw_drop_zone(f, chunks[2], app, &palette);
-    draw_toast(f, chunks[3], app, &palette);
-    draw_help_bar(f, chunks[4], app, &palette);
+    draw_toast(f, body_chunks[3], app, &palette);
+    draw_help_bar(f, body_chunks[4], app, &palette);
 
     if app.help_visible {
         draw_help_overlay(f, size, &palette);
@@ -70,6 +57,234 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     }
     if app.ssh_picker.is_some() {
         draw_ssh_picker(f, size, app, &palette);
+    }
+}
+
+fn draw_tab_bar(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
+    let mut spans: Vec<Span> = Vec::new();
+    spans.push(Span::raw(" "));
+    for (i, tab) in [Tab::Drop, Tab::Watch].iter().enumerate() {
+        let active = app.current_tab == *tab;
+        let key = match tab {
+            Tab::Drop => "1",
+            Tab::Watch => "2",
+        };
+        let style = if active {
+            Style::default()
+                .bg(p.accent)
+                .fg(p.bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.muted)
+        };
+        spans.push(Span::styled(format!(" {} {} ", key, tab.label()), style));
+        if i == 0 {
+            spans.push(Span::raw(" "));
+        }
+    }
+    // Tail — show watch activity count when not on the Watch tab so the
+    // user notices if the poller is firing in the background.
+    let live_watches = app.watch_handles.len();
+    if live_watches > 0 && app.current_tab != Tab::Watch {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(
+            format!("● {live_watches} watching"),
+            Style::default().fg(p.diff_add),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_drop_tab_body(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
+    let drop_zone_h = 8.min(area.height.saturating_sub(2));
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(6),              // targets + activity
+            Constraint::Length(drop_zone_h), // drop zone
+        ])
+        .split(area);
+    let tp_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[0]);
+
+    app.hit_regions.targets_panel = tp_row[0];
+    app.hit_regions.progress_panel = tp_row[1];
+    app.hit_regions.drop_zone = chunks[1];
+
+    draw_targets(f, tp_row[0], app, p);
+    draw_activity(f, tp_row[1], app, p);
+    draw_drop_zone(f, chunks[1], app, p);
+}
+
+fn draw_watch_tab_body(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(area);
+    draw_watches(f, chunks[0], app, p);
+    draw_watch_recent(f, chunks[1], app, p);
+}
+
+fn draw_watches(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
+    let focused = app.focus == Focus::Watches;
+    let title = if focused { " Folders " } else { " folders " };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(border_style(focused, p));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if app.watches.is_empty() {
+        let hint = vec![
+            Line::from(Span::styled(
+                "  No watches configured.",
+                Style::default().fg(p.muted),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Add a [[watch]] block to your config.toml — see examples/",
+                Style::default().fg(p.muted),
+            )),
+            Line::from(""),
+            Line::from(Span::styled("    [[watch]]", Style::default().fg(p.muted))),
+            Line::from(Span::styled(
+                "    name    = \"screenshots\"",
+                Style::default().fg(p.muted),
+            )),
+            Line::from(Span::styled(
+                "    path    = \"~/Desktop\"",
+                Style::default().fg(p.muted),
+            )),
+            Line::from(Span::styled(
+                "    targets = [\"dev\"]",
+                Style::default().fg(p.muted),
+            )),
+        ];
+        f.render_widget(Paragraph::new(hint).wrap(Wrap { trim: false }), inner);
+        return;
+    }
+
+    // Clamp the cursor to the current list size.
+    let max = app.watches.len().saturating_sub(1);
+    if app.watch_cursor > max {
+        app.watch_cursor = max;
+    }
+    let cursor = app.watch_cursor;
+    let lines: Vec<Line<'_>> = app
+        .watches
+        .iter()
+        .enumerate()
+        .map(|(i, w)| render_watch_row(w, i == cursor && focused, p))
+        .collect();
+
+    // Manual paragraph render lets us do per-row cursor highlighting via bg.
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_watch_row<'a>(w: &'a WatchUi, is_cursor: bool, p: &theme::Palette) -> Line<'a> {
+    let (glyph, glyph_style) = match &w.status {
+        WatchUiStatus::Off => ("○", Style::default().fg(p.muted)),
+        WatchUiStatus::Starting => ("●", Style::default().fg(p.accent)),
+        WatchUiStatus::Running => (
+            "●",
+            Style::default().fg(p.diff_add).add_modifier(Modifier::BOLD),
+        ),
+        WatchUiStatus::LockedByOther(_) => ("⚠", Style::default().fg(p.diff_del)),
+        WatchUiStatus::Error(_) => ("✗", Style::default().fg(p.diff_del)),
+    };
+    let name = pad_or_trunc(&w.name, 14);
+    let path = pad_or_trunc(&w.path_display, 30);
+    let targets = pad_or_trunc(&format!("→ {}", w.targets_display), 22);
+    let base_tail = match &w.status {
+        WatchUiStatus::Off => format!("{} synced", w.synced_count),
+        WatchUiStatus::Starting => "starting…".to_string(),
+        WatchUiStatus::Running => format!("{} synced", w.synced_count),
+        WatchUiStatus::LockedByOther(pid) => format!("locked by PID {pid}"),
+        WatchUiStatus::Error(msg) => truncate_cols(msg, 30),
+    };
+    let tail = if !w.pending_catchup.is_empty() {
+        format!("{base_tail}  ({} new — press r)", w.pending_catchup.len())
+    } else {
+        base_tail
+    };
+    let tail_style = match &w.status {
+        WatchUiStatus::Off => Style::default().fg(p.muted),
+        WatchUiStatus::Starting => Style::default().fg(p.accent),
+        WatchUiStatus::Running => Style::default().fg(p.diff_add),
+        WatchUiStatus::LockedByOther(_) | WatchUiStatus::Error(_) => {
+            Style::default().fg(p.diff_del)
+        }
+    };
+    let base_style = if is_cursor {
+        Style::default()
+            .bg(p.selection)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.fg)
+    };
+    Line::from(vec![
+        Span::styled(" ", base_style),
+        Span::styled(glyph.to_string(), glyph_style.patch(base_style)),
+        Span::styled(" ", base_style),
+        Span::styled(name, base_style),
+        Span::styled(" ", base_style),
+        Span::styled(path, base_style.patch(Style::default().fg(p.muted))),
+        Span::styled(" ", base_style),
+        Span::styled(targets, base_style.patch(Style::default().fg(p.accent))),
+        Span::styled(" ", base_style),
+        Span::styled(tail, base_style.patch(tail_style)),
+    ])
+}
+
+fn draw_watch_recent(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
+    let block = Block::default()
+        .title(" recent ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.muted));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if app.watch_recent.is_empty() {
+        let msg = Paragraph::new(Line::from(Span::styled(
+            "  (no files synced yet — enable a watch above with Space)",
+            Style::default().fg(p.muted),
+        )));
+        f.render_widget(msg, inner);
+        return;
+    }
+    let lines: Vec<Line<'_>> = app
+        .watch_recent
+        .iter()
+        .take(inner.height as usize)
+        .map(|e| {
+            let ago = humanize_elapsed(e.at);
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled("📸", Style::default().fg(p.accent)),
+                Span::raw(" "),
+                Span::styled(pad_or_trunc(&e.file_display, 28), Style::default().fg(p.fg)),
+                Span::raw(" "),
+                Span::styled(format!("→ {}", e.watch_name), Style::default().fg(p.accent)),
+                Span::raw("  "),
+                Span::styled(ago, Style::default().fg(p.muted)),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn humanize_elapsed(t: std::time::Instant) -> String {
+    let d = t.elapsed();
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h ago", secs / 3600)
     }
 }
 
@@ -299,7 +514,7 @@ fn draw_update_overlay(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::
             }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "  Restart lzscp to use the new version.",
+                "  Restart lzsync to use the new version.",
                 Style::default().fg(p.fg),
             )));
             lines.push(Line::from(""));
@@ -373,7 +588,7 @@ fn draw_title(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) 
     };
     let title = Line::from(vec![
         Span::styled(
-            " lzscp ",
+            " lzsync ",
             Style::default()
                 .bg(p.accent)
                 .fg(p.bg)
@@ -871,6 +1086,11 @@ fn render_live_line(
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let filename = if t.source_watch.is_some() {
+        format!("📸 {filename}")
+    } else {
+        filename
+    };
     build_row_line(
         icon,
         icon_color,
@@ -905,11 +1125,16 @@ fn render_history_group_line(
     };
     let target = pad_or_trunc(&target_label, TARGET_COL);
     let right = crate::history::format_time_ago(g.primary.synced_at);
+    let filename = if g.primary.source_watch.is_some() {
+        format!("📸 {}", g.primary.local_name)
+    } else {
+        g.primary.local_name.clone()
+    };
     build_row_line(
         "✓",
         p.diff_add,
         target,
-        g.primary.local_name.clone(),
+        filename,
         p.fg,
         right,
         Style::default().fg(p.muted),
@@ -1056,6 +1281,7 @@ fn draw_help_overlay(f: &mut Frame<'_>, area: Rect, p: &theme::Palette) {
         .border_style(Style::default().fg(p.accent))
         .style(Style::default().bg(p.bg).fg(p.fg));
     let lines = vec![
+        Line::from("  Ctrl+1 / Ctrl+2    switch Drop / Watch tab"),
         Line::from("  Ctrl+P             open menu / command palette"),
         Line::from("  Ctrl+H             toggle this help"),
         Line::from("  Ctrl+Q / Ctrl+C    quit"),
@@ -1064,11 +1290,10 @@ fn draw_help_overlay(f: &mut Frame<'_>, area: Rect, p: &theme::Palette) {
         Line::from("  Ctrl+A / Ctrl+N    auto / manual mode"),
         Line::from("  Ctrl+F             cycle clipboard format (or filter in Activity)"),
         Line::from(""),
-        Line::from("  Tab / Shift+Tab    cycle focus"),
-        Line::from("  Up / Down          move cursor"),
+        Line::from("  Tab / Shift+Tab    cycle focus within tab"),
+        Line::from("  Up / Down / j / k  move cursor"),
         Line::from("  Enter              sync (DropZone) or copy (Activity)"),
-        Line::from("  Space              toggle selected target (Targets focus)"),
-        Line::from("  1–9                quick-toggle Nth target (Targets focus)"),
+        Line::from("  Space              toggle target / watch folder"),
         Line::from("  Backspace          remove queued file under cursor"),
         Line::from("  click a row        copy that remote path to clipboard"),
         Line::from(""),

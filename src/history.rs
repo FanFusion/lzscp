@@ -16,11 +16,16 @@ pub struct HistoryEntry {
     pub local_path: String,
     pub local_name: String,
     pub size: u64,
+    #[serde(default)]
+    pub mtime: u64, // unix epoch seconds; 0 when unknown
     pub target_name: String,
     pub target_host: String,
     pub remote_path: String,
     pub synced_at: u64, // unix epoch seconds
     pub status: HistoryStatus,
+    /// Watch name if this transfer originated from a folder watch, else None.
+    #[serde(default)]
+    pub source_watch: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,7 +44,7 @@ impl Default for HistoryStore {
     fn default() -> Self {
         Self {
             entries: vec![],
-            base: history_dir().unwrap_or_else(|| PathBuf::from(".lzscp/history")),
+            base: history_dir().unwrap_or_else(|| PathBuf::from(".lzsync/history")),
         }
     }
 }
@@ -171,7 +176,7 @@ pub fn format_time_ago(epoch: u64) -> String {
 }
 
 pub fn history_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("lzscp/history"))
+    dirs::config_dir().map(|d| d.join("lzsync/history"))
 }
 
 fn sanitize_filename(name: &str) -> String {
@@ -203,11 +208,13 @@ mod tests {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             size: 123,
+            mtime: 0,
             target_name: target.to_string(),
             target_host: format!("user@{target}"),
             remote_path: remote.to_string(),
             synced_at: at,
             status: HistoryStatus::Completed,
+            source_watch: None,
         }
     }
 

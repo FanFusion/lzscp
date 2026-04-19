@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# lzscp one-liner installer.
+# lzsync one-liner installer.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/FanFusion/lzscp/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/FanFusion/lzsync/main/install.sh | bash
 #
 # Env overrides:
 #   INSTALL_DIR  destination directory (default: $HOME/.local/bin)
-#   VERSION      specific version tag, e.g. VERSION=v0.1.0 (default: latest)
+#   VERSION      specific version tag, e.g. VERSION=v0.4.0 (default: latest)
 
 set -euo pipefail
 
-REPO="FanFusion/lzscp"
+REPO="FanFusion/lzsync"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 VERSION="${VERSION:-latest}"
 
@@ -19,7 +19,7 @@ green()  { printf '\033[0;32m%s\033[0m\n' "$*"; }
 yellow() { printf '\033[0;33m%s\033[0m\n' "$*"; }
 bold()   { printf '\033[1m%s\033[0m\n' "$*"; }
 
-bold "lzscp installer"
+bold "lzsync installer"
 echo
 
 # --- Detect platform --------------------------------------------------------
@@ -39,7 +39,7 @@ case "$uname_m" in
     *) red "Unsupported architecture: $uname_m"; exit 1 ;;
 esac
 
-artifact="lzscp-${os}-${arch}"
+artifact="lzsync-${os}-${arch}"
 echo "Platform: ${os}/${arch} -> ${artifact}"
 
 # --- Pick download URL ------------------------------------------------------
@@ -51,7 +51,7 @@ else
 fi
 
 echo "Source:   $url"
-echo "Install:  $INSTALL_DIR/lzscp"
+echo "Install:  $INSTALL_DIR/lzsync"
 echo
 
 # --- Prep destination -------------------------------------------------------
@@ -60,7 +60,7 @@ mkdir -p "$INSTALL_DIR"
 
 # --- Download --------------------------------------------------------------
 
-tmp=$(mktemp -t lzscp.XXXXXX)
+tmp=$(mktemp -t lzsync.XXXXXX)
 trap 'rm -f "$tmp"' EXIT
 
 if command -v curl >/dev/null 2>&1; then
@@ -80,16 +80,16 @@ fi
 
 # --- Install ----------------------------------------------------------------
 
-install -m 755 "$tmp" "$INSTALL_DIR/lzscp"
-installed_version=$("$INSTALL_DIR/lzscp" --version 2>/dev/null || echo "lzscp")
-green "Installed $installed_version -> $INSTALL_DIR/lzscp"
+install -m 755 "$tmp" "$INSTALL_DIR/lzsync"
+installed_version=$("$INSTALL_DIR/lzsync" --version 2>/dev/null || echo "lzsync")
+green "Installed $installed_version -> $INSTALL_DIR/lzsync"
 
 # --- macOS gatekeeper hint --------------------------------------------------
 
 if [ "$os" = "macos" ]; then
-    if xattr "$INSTALL_DIR/lzscp" 2>/dev/null | grep -q com.apple.quarantine; then
+    if xattr "$INSTALL_DIR/lzsync" 2>/dev/null | grep -q com.apple.quarantine; then
         yellow "macOS marked the binary as quarantined. Removing…"
-        xattr -d com.apple.quarantine "$INSTALL_DIR/lzscp" || true
+        xattr -d com.apple.quarantine "$INSTALL_DIR/lzsync" || true
     fi
 fi
 
@@ -106,4 +106,4 @@ case ":$PATH:" in
 esac
 
 echo
-green "Done. Try: lzscp --help"
+green "Done. Try: lzsync --help"

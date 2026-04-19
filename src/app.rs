@@ -10,8 +10,9 @@ use tokio::sync::mpsc;
 use crate::config::Config;
 use crate::history::{HistoryEntry, HistoryStatus, HistoryStore};
 use crate::path_input;
-use crate::target::{ClipboardFormat, SyncMode};
+use crate::target::{CatchupMode, ClipboardFormat, SyncMode, WatchConfig};
 use crate::transfer::{self, Transfer, TransferEvent, TransferState};
+use crate::watch::{self, LockError, PersistedState, WatchEvent, WatchHandle};
 
 #[derive(Debug, Clone)]
 pub enum AppEvent {
@@ -28,6 +29,25 @@ pub enum AppEvent {
         result: std::result::Result<(), String>,
     },
     RsyncVersionWarning(String),
+    /// Emitted by a running folder-watch poller.
+    WatchUpdate(WatchEvent),
+}
+
+/// Which top-level tab is in focus.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Tab {
+    #[default]
+    Drop,
+    Watch,
+}
+
+impl Tab {
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::Drop => "Drop",
+            Tab::Watch => "Watch",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -46,6 +66,8 @@ pub enum Focus {
     DropZone,
     Targets,
     Progress,
+    /// Watch tab — Folders list.
+    Watches,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +212,47 @@ pub struct SshPicker {
     pub cursor: usize,
 }
 
+/// Watch tab — one row per configured `[[watch]]` block.
+#[derive(Debug, Clone)]
+pub struct WatchUi {
+    pub name: String,
+    pub path_display: String,
+    pub targets_display: String,
+    pub config: WatchConfig,
+    pub status: WatchUiStatus,
+    pub synced_count: u64,
+    pub last_error: Option<String>,
+    /// Files that existed at startup with mtime newer than the persisted
+    /// `last_seen_mtime`. Only populated for `catchup = "prompt"` watches.
+    /// Press `r` in the Folders panel to flush these into transfers.
+    pub pending_catchup: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchUiStatus {
+    Off,
+    /// Trying to take the folder lock.
+    Starting,
+    /// Lock held, poller running.
+    Running,
+    /// Another live process holds this folder's lock.
+    LockedByOther(u32),
+    /// Resolver / filesystem / lock error.
+    Error(String),
+}
+
+/// Event emitted by a running poller and recorded for display in the Watch
+/// tab's Recent panel. Kept separate from `history` so watch-specific info
+/// (which watch produced the event) is preserved.
+#[derive(Debug, Clone)]
+pub struct RecentWatchEvent {
+    pub watch_name: String,
+    pub file_display: String,
+    #[allow(dead_code)] // kept for future Activity-row click-to-copy wiring
+    pub path: PathBuf,
+    pub at: std::time::Instant,
+}
+
 /// Identity of a row rendered in the Activity panel. Lets the key handler
 /// act on the renderer's exact ordering (live transfers first, then merged
 /// history groups).
@@ -207,10 +270,19 @@ pub struct App {
     pub mode: SyncMode,
     pub clipboard_format: ClipboardFormat,
     pub focus: Focus,
+    pub current_tab: Tab,
     pub should_quit: bool,
 
     pub target_rows: Vec<TargetRow>,
     pub target_cursor: usize,
+
+    pub watches: Vec<WatchUi>,
+    pub watch_cursor: usize,
+    pub watch_handles: HashMap<String, WatchHandle>,
+    pub watch_recent: Vec<RecentWatchEvent>,
+    pub watch_tx: mpsc::UnboundedSender<WatchEvent>,
+    pub watch_rx: mpsc::UnboundedReceiver<WatchEvent>,
+    pub watch_state: PersistedState,
 
     pub queue: Vec<PathBuf>,
     pub queue_cursor: usize,
@@ -291,15 +363,30 @@ impl App {
         let clipboard_format = cfg.clipboard_format;
         let (tx, rx) = mpsc::unbounded_channel();
         let (app_tx, app_rx) = mpsc::unbounded_channel();
+        let (watch_tx, watch_rx) = mpsc::unbounded_channel();
+        let startup_toast = cfg
+            .migration_notice
+            .clone()
+            .map(|msg| (msg, std::time::Instant::now()));
+        let watches: Vec<WatchUi> = cfg.watches.iter().map(WatchUi::from_config).collect();
+        let watch_state = watch::load_state();
 
         Self {
             cfg,
             mode,
             clipboard_format,
             focus: Focus::DropZone,
+            current_tab: Tab::Drop,
             should_quit: false,
             target_rows: rows,
             target_cursor: 0,
+            watches,
+            watch_cursor: 0,
+            watch_handles: HashMap::new(),
+            watch_recent: Vec::new(),
+            watch_tx,
+            watch_rx,
+            watch_state,
             queue: vec![],
             queue_cursor: 0,
             last_paste_error: None,
@@ -307,7 +394,7 @@ impl App {
             transfer_index: HashMap::new(),
             next_transfer_id: 1,
             last_clipboard: None,
-            toast: None,
+            toast: startup_toast,
             help_visible: false,
             menu_visible: false,
             menu_cursor: 0,
@@ -371,6 +458,7 @@ impl App {
                 result,
             } => self.apply_remote_install_result(&target_name, result),
             AppEvent::RsyncVersionWarning(msg) => self.toast(&msg),
+            AppEvent::WatchUpdate(evt) => self.handle_watch_event(evt),
         }
     }
 
@@ -804,8 +892,16 @@ impl App {
                         self.cycle_clipboard_format();
                     }
                 }
+                '1' => self.switch_tab(Tab::Drop),
+                '2' => self.switch_tab(Tab::Watch),
                 _ => {}
             },
+            // Watch tab: Space toggles the current folder, j/k move cursor,
+            // r flushes the current watch's pending catchup batch.
+            KeyCode::Char(' ') if self.focus == Focus::Watches => self.toggle_current_watch(),
+            KeyCode::Char('j') if self.focus == Focus::Watches => self.move_watch_cursor(1),
+            KeyCode::Char('k') if self.focus == Focus::Watches => self.move_watch_cursor(-1),
+            KeyCode::Char('r') if self.focus == Focus::Watches => self.flush_current_catchup(),
             // Space / 1–9 still act as Targets-panel conveniences — they
             // fire ONLY when Targets is focused, so a path dropped into the
             // DropZone can't toggle anything.
@@ -1269,7 +1365,12 @@ impl App {
     }
 
     fn cycle_focus(&mut self, dir: i32) {
-        let order = [Focus::DropZone, Focus::Targets, Focus::Progress];
+        // Focus cycle is tab-scoped: Drop tab has three panes, Watch tab has
+        // only one (Folders) and Tab / Shift+Tab is a no-op there.
+        let order: &[Focus] = match self.current_tab {
+            Tab::Drop => &[Focus::DropZone, Focus::Targets, Focus::Progress],
+            Tab::Watch => &[Focus::Watches],
+        };
         let idx = order.iter().position(|f| *f == self.focus).unwrap_or(0);
         let n = order.len() as i32;
         let next = ((idx as i32 + dir).rem_euclid(n)) as usize;
@@ -1295,6 +1396,7 @@ impl App {
                 self.target_cursor = next as usize;
             }
             Focus::Progress => self.move_activity_cursor(delta),
+            Focus::Watches => self.move_watch_cursor(delta),
         }
     }
 
@@ -1422,16 +1524,25 @@ impl App {
             }
             TransferEvent::Line { .. } => {}
             TransferEvent::Completed { id, remote_abs_dir } => {
-                let (local, target_name) = match self.transfer_mut(id) {
+                let (local, target_name, source_watch) = match self.transfer_mut(id) {
                     Some(t) => {
                         t.state = TransferState::Completed;
                         t.percent = 100;
                         t.remote_abs_dir = remote_abs_dir.clone();
-                        (t.local.clone(), t.target_name.clone())
+                        (
+                            t.local.clone(),
+                            t.target_name.clone(),
+                            t.source_watch.clone(),
+                        )
                     }
                     None => return,
                 };
-                self.record_history(&target_name, &local, &remote_abs_dir);
+                self.record_history(
+                    &target_name,
+                    &local,
+                    &remote_abs_dir,
+                    source_watch.as_deref(),
+                );
                 self.update_clipboard_for_completed(&target_name, &local, &remote_abs_dir);
             }
             TransferEvent::Failed { id, error } => {
@@ -1449,7 +1560,13 @@ impl App {
         self.transfers.get_mut(idx)
     }
 
-    fn record_history(&mut self, target_name: &str, local: &std::path::Path, remote_abs_dir: &str) {
+    fn record_history(
+        &mut self,
+        target_name: &str,
+        local: &std::path::Path,
+        remote_abs_dir: &str,
+        source_watch: Option<&str>,
+    ) {
         let Some(target) = self.cfg.target_by_name(target_name) else {
             return;
         };
@@ -1466,16 +1583,24 @@ impl App {
             Some(u) => format!("{u}@{}", target.host),
             None => target.host.clone(),
         };
-        let size = std::fs::metadata(local).map(|m| m.len()).unwrap_or(0);
+        let meta = std::fs::metadata(local).ok();
+        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let mtime = meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let entry = HistoryEntry {
             local_path: local_abs,
             local_name,
             size,
+            mtime,
             target_name: target_name.to_string(),
             target_host,
             remote_path,
             synced_at: crate::history::now_epoch(),
             status: HistoryStatus::Completed,
+            source_watch: source_watch.map(|s| s.to_string()),
         };
         if let Err(e) = self.history.append(entry) {
             self.toast(&format!("history append failed: {e}"));
@@ -1528,6 +1653,284 @@ impl App {
 
     fn toast(&mut self, msg: &str) {
         self.toast = Some((msg.to_string(), std::time::Instant::now()));
+    }
+
+    // =====================
+    // Tab switching
+    // =====================
+
+    pub fn switch_tab(&mut self, tab: Tab) {
+        if self.current_tab == tab {
+            return;
+        }
+        self.current_tab = tab;
+        self.focus = match tab {
+            Tab::Drop => Focus::DropZone,
+            Tab::Watch => Focus::Watches,
+        };
+    }
+
+    // =====================
+    // Watch tab actions
+    // =====================
+
+    pub fn move_watch_cursor(&mut self, delta: i32) {
+        if self.watches.is_empty() {
+            self.watch_cursor = 0;
+            return;
+        }
+        let len = self.watches.len() as i32;
+        let new = (self.watch_cursor as i32 + delta).rem_euclid(len);
+        self.watch_cursor = new as usize;
+    }
+
+    /// Toggle the watch at the current cursor on / off.
+    pub fn toggle_current_watch(&mut self) {
+        let Some(ui) = self.watches.get(self.watch_cursor) else {
+            return;
+        };
+        let name = ui.name.clone();
+        if self.watch_handles.contains_key(&name) {
+            self.stop_watch(&name);
+        } else {
+            self.start_watch(&name);
+        }
+    }
+
+    fn start_watch(&mut self, name: &str) {
+        let idx = match self.watches.iter().position(|w| w.name == name) {
+            Some(i) => i,
+            None => return,
+        };
+        let cfg = self.watches[idx].config.clone();
+        let abs_path = match watch::resolve_path(&cfg.path) {
+            Ok(p) => p,
+            Err(e) => {
+                self.watches[idx].status = WatchUiStatus::Error(format!("resolve path: {e}"));
+                return;
+            }
+        };
+        if !abs_path.exists() {
+            self.watches[idx].status =
+                WatchUiStatus::Error(format!("directory not found: {}", abs_path.display()));
+            return;
+        }
+        self.watches[idx].status = WatchUiStatus::Starting;
+        let last_seen = self
+            .watch_state
+            .watches
+            .get(name)
+            .map(|s| s.last_seen_mtime)
+            .unwrap_or(0);
+        match watch::try_acquire_lock(name, &abs_path) {
+            Ok(lock) => {
+                let handle = watch::start_poller(cfg, lock, self.watch_tx.clone(), last_seen);
+                self.watch_handles.insert(name.to_string(), handle);
+                self.watches[idx].status = WatchUiStatus::Running;
+                self.watches[idx].last_error = None;
+                self.toast(&format!("watching {}", self.watches[idx].path_display));
+            }
+            Err(LockError::Held { pid }) => {
+                self.watches[idx].status = WatchUiStatus::LockedByOther(pid);
+                self.toast(&format!(
+                    "{} is locked by PID {pid}",
+                    self.watches[idx].name
+                ));
+            }
+            Err(LockError::Io(msg)) => {
+                self.watches[idx].status = WatchUiStatus::Error(msg.clone());
+                self.toast(&format!("watch error: {msg}"));
+            }
+        }
+    }
+
+    fn stop_watch(&mut self, name: &str) {
+        if let Some(handle) = self.watch_handles.remove(name) {
+            handle.stop();
+        }
+        if let Some(ui) = self.watches.iter_mut().find(|w| w.name == name) {
+            ui.status = WatchUiStatus::Off;
+        }
+        self.toast(&format!("stopped watching {name}"));
+    }
+
+    /// Handle an event coming off the watch channel. For the UI stage we
+    /// only record it in the Recent panel; Stage 5 will wire NewFile to the
+    /// transfer flow.
+    pub fn handle_watch_event(&mut self, evt: WatchEvent) {
+        match evt {
+            WatchEvent::NewFile {
+                watch_name,
+                path,
+                size: _,
+            } => {
+                let file_display = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                self.watch_recent.insert(
+                    0,
+                    RecentWatchEvent {
+                        watch_name: watch_name.clone(),
+                        file_display,
+                        path: path.clone(),
+                        at: std::time::Instant::now(),
+                    },
+                );
+                // Keep the recent list bounded.
+                self.watch_recent.truncate(20);
+                if let Some(ui) = self.watches.iter_mut().find(|w| w.name == watch_name) {
+                    ui.synced_count += 1;
+                }
+                // Stage 5 will enqueue the file here. For now just enqueue the
+                // path so auto-mode users see it land in Activity too.
+                self.enqueue_watch_file(&watch_name, path);
+            }
+            WatchEvent::CatchupDetected { watch_name, paths } => {
+                let count = paths.len();
+                if let Some(ui) = self.watches.iter_mut().find(|w| w.name == watch_name) {
+                    ui.pending_catchup = paths;
+                }
+                self.toast(&format!(
+                    "{watch_name} has {count} file(s) to catch up — press r to flush"
+                ));
+            }
+            WatchEvent::LockLost { watch_name, reason } => {
+                if let Some(ui) = self.watches.iter_mut().find(|w| w.name == watch_name) {
+                    ui.status = WatchUiStatus::Error(reason.clone());
+                }
+                self.watch_handles.remove(&watch_name);
+                self.toast(&format!("watch {watch_name}: {reason}"));
+            }
+            WatchEvent::Stopped { watch_name } => {
+                if let Some(ui) = self.watches.iter_mut().find(|w| w.name == watch_name)
+                    && matches!(ui.status, WatchUiStatus::Running)
+                {
+                    ui.status = WatchUiStatus::Off;
+                }
+            }
+        }
+    }
+
+    fn enqueue_watch_file(&mut self, watch_name: &str, path: PathBuf) {
+        let Some(watch_cfg) = self
+            .cfg
+            .watches
+            .iter()
+            .find(|w| w.name == watch_name)
+            .cloned()
+        else {
+            return;
+        };
+        // Watch-sourced files bypass the selected-targets UI and always fire
+        // on the watch's configured targets. Manual mode still defers the
+        // actual rsync until the user presses Enter — we queue the file but
+        // tag it so start_queue_sync knows which targets to use.
+        let target_names: Vec<String> = watch_cfg
+            .targets
+            .iter()
+            .flat_map(|n| {
+                // Expand group names to member targets.
+                if let Some(g) = self.cfg.group_by_name(n) {
+                    g.targets.clone()
+                } else {
+                    vec![n.clone()]
+                }
+            })
+            .collect();
+        if target_names.is_empty() {
+            self.toast(&format!(
+                "watch '{watch_name}' has no usable targets — skipping {}",
+                path.display()
+            ));
+            return;
+        }
+        if matches!(self.mode, SyncMode::Auto) {
+            self.spawn_watch_transfer(watch_name, &target_names, path);
+        } else {
+            // Manual mode: push into queue so the user sees it and Enter works.
+            // We lose the watch->target binding here; the user will use the
+            // currently-selected targets. That's the explicit cost of manual
+            // mode with watches.
+            self.queue.push(path);
+        }
+    }
+
+    /// Flush the current watch row's pending catchup: synthesize NewFile
+    /// events for each path and feed them through the normal enqueue path.
+    pub fn flush_current_catchup(&mut self) {
+        let Some(ui) = self.watches.get_mut(self.watch_cursor) else {
+            return;
+        };
+        if ui.pending_catchup.is_empty() {
+            self.toast("nothing to catch up");
+            return;
+        }
+        let name = ui.name.clone();
+        let paths: Vec<PathBuf> = std::mem::take(&mut ui.pending_catchup);
+        let count = paths.len();
+        for p in paths {
+            // Reuse the same code path as live events so watch→targets
+            // mapping, auto/manual mode, and source tagging all behave
+            // identically.
+            self.enqueue_watch_file(&name, p);
+        }
+        self.toast(&format!("catching up {count} file(s) from {name}"));
+    }
+
+    /// Persist per-watch `last_seen_mtime` on quit so catchup on the next
+    /// session only scans files added after this exit.
+    pub fn persist_watch_state(&mut self) {
+        let now = crate::history::now_epoch();
+        for ui in &self.watches {
+            let entry = self.watch_state.watches.entry(ui.name.clone()).or_default();
+            entry.last_seen_mtime = now;
+            entry.last_exit_at = now;
+        }
+        if let Err(e) = watch::save_state(&self.watch_state) {
+            eprintln!("warning: failed to persist watch-state: {e}");
+        }
+    }
+
+    fn spawn_watch_transfer(&mut self, watch_name: &str, target_names: &[String], path: PathBuf) {
+        for tname in target_names {
+            let Some(target) = self.cfg.target_by_name(tname) else {
+                continue;
+            };
+            let id = self.next_transfer_id;
+            self.next_transfer_id += 1;
+            let transfer =
+                Transfer::new_from_watch(id, target, path.clone(), watch_name.to_string());
+            self.transfer_index.insert(id, self.transfers.len());
+            self.transfers.push(transfer);
+            transfer::spawn(id, target.clone(), path.clone(), self.transfer_tx.clone());
+        }
+    }
+}
+
+impl WatchUi {
+    pub fn from_config(cfg: &WatchConfig) -> Self {
+        let targets_display = cfg.targets.join(", ");
+        let path_display = cfg.path.clone();
+        Self {
+            name: cfg.name.clone(),
+            path_display,
+            targets_display,
+            config: cfg.clone(),
+            status: WatchUiStatus::Off,
+            synced_count: 0,
+            last_error: None,
+            pending_catchup: Vec::new(),
+        }
+    }
+
+    #[allow(dead_code)] // exposed for future help / status UI
+    pub fn catchup_label(&self) -> &'static str {
+        match self.config.catchup {
+            CatchupMode::Prompt => "prompt",
+            CatchupMode::Auto => "auto",
+            CatchupMode::Ignore => "ignore",
+        }
     }
 }
 

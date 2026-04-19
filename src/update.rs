@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-const VERSION_URL: &str = "https://raw.githubusercontent.com/FanFusion/lzscp/main/VERSION";
+const VERSION_URL: &str = "https://raw.githubusercontent.com/FanFusion/lzsync/main/VERSION";
 
 /// Fetch remote VERSION. Returns Some(version) if newer than current, None if
 /// same-or-older.
@@ -43,7 +43,7 @@ fn parse_semver(s: &str) -> (u32, u32, u32) {
 }
 
 /// Download the release binary for `version` and install to both
-/// `~/.cargo/bin/lzscp` and `~/.local/bin/lzscp`. Returns the list of paths
+/// `~/.cargo/bin/lzsync` and `~/.local/bin/lzsync`. Returns the list of paths
 /// that were actually written.
 ///
 /// Safe to run while the caller is still executing the old binary: we write
@@ -53,7 +53,7 @@ pub async fn download_and_install(version: &str) -> Result<Vec<PathBuf>> {
     let ver = version.trim().trim_start_matches('v').to_string();
     let platform = detect_platform()?;
     let url =
-        format!("https://github.com/FanFusion/lzscp/releases/download/v{ver}/lzscp-{platform}");
+        format!("https://github.com/FanFusion/lzsync/releases/download/v{ver}/lzsync-{platform}");
     let url_for_thread = url.clone();
 
     let bytes: Vec<u8> = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
@@ -76,7 +76,10 @@ pub async fn download_and_install(version: &str) -> Result<Vec<PathBuf>> {
     .context("join error")??;
 
     let home = dirs::home_dir().context("HOME not set")?;
-    let targets = [home.join(".cargo/bin/lzscp"), home.join(".local/bin/lzscp")];
+    let targets = [
+        home.join(".cargo/bin/lzsync"),
+        home.join(".local/bin/lzsync"),
+    ];
 
     let mut installed = Vec::new();
     for dst in &targets {

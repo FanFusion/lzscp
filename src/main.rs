@@ -8,6 +8,7 @@ mod target;
 mod transfer;
 mod ui;
 mod update;
+mod watch;
 
 use std::io::{self, Stdout};
 use std::time::Duration;
@@ -31,11 +32,13 @@ use crate::app::{App, AppEvent};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn print_help() {
-    println!("lzscp {VERSION}");
-    println!("Lazy SCP — drag-drop file sync to SSH hosts with auto clipboard path return");
+    println!("lzsync {VERSION}");
+    println!(
+        "Lazy Sync — drag-drop & folder-watch file sync to SSH hosts with auto clipboard path return"
+    );
     println!();
     println!("USAGE:");
-    println!("    lzscp [OPTIONS]");
+    println!("    lzsync [OPTIONS]");
     println!();
     println!("OPTIONS:");
     println!("    -h, --help        Print this help");
@@ -43,8 +46,8 @@ fn print_help() {
     println!("        --check       Check for updates and exit");
     println!();
     println!("CONFIG:");
-    println!("    Project:  $PWD/.lzscp/config.toml");
-    println!("    Global:   $XDG_CONFIG_HOME/lzscp/config.toml");
+    println!("    Project:  $PWD/.lzsync/config.toml");
+    println!("    Global:   $XDG_CONFIG_HOME/lzsync/config.toml");
 }
 
 #[tokio::main]
@@ -53,7 +56,7 @@ async fn main() -> Result<()> {
     if let Some(a) = args.first() {
         match a.as_str() {
             "-V" | "--version" => {
-                println!("lzscp {VERSION}");
+                println!("lzsync {VERSION}");
                 return Ok(());
             }
             "-h" | "--help" => {
@@ -63,7 +66,7 @@ async fn main() -> Result<()> {
             "--check" => {
                 match update::check_for_updates().await {
                     Ok(Some(v)) => println!("New version available: {v} (current {VERSION})"),
-                    Ok(None) => println!("lzscp is up to date ({VERSION})"),
+                    Ok(None) => println!("lzsync is up to date ({VERSION})"),
                     Err(e) => eprintln!("Update check failed: {e}"),
                 }
                 return Ok(());
@@ -136,8 +139,12 @@ async fn run_app(
             Some(app_evt) = app.app_rx.recv() => {
                 app.handle_event(app_evt);
             }
+            Some(watch_evt) = app.watch_rx.recv() => {
+                app.handle_event(AppEvent::WatchUpdate(watch_evt));
+            }
         }
     }
 
+    app.persist_watch_state();
     Ok(())
 }

@@ -16,17 +16,17 @@ jobs:
           # Use ubuntu-22.04 for GLIBC 2.35 compatibility
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            artifact: lzscp-linux-x86_64
+            artifact: lzsync-linux-x86_64
           - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
-            artifact: lzscp-linux-aarch64
+            artifact: lzsync-linux-aarch64
             cross: true
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact: lzscp-macos-x86_64
+            artifact: lzsync-macos-x86_64
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: lzscp-macos-aarch64
+            artifact: lzsync-macos-aarch64
 
     runs-on: ${{ matrix.os }}
 
@@ -53,7 +53,7 @@ jobs:
       - name: Prepare artifact
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/lzscp dist/${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/lzsync dist/${{ matrix.artifact }}
           chmod +x dist/${{ matrix.artifact }}
 
       - name: Upload artifact

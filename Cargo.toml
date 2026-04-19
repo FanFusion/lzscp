@@ -1,17 +1,17 @@
 [package]
-name = "lzscp"
-version = "0.3.6"
+name = "lzsync"
+version = "0.4.0"
 edition = "2024"
-description = "Lazy SCP — a local TUI for drag-drop file sync to SSH hosts with auto clipboard path return"
+description = "Lazy Sync — a local TUI for drag-drop & folder-watch file sync to SSH hosts with auto clipboard path return"
 readme = "README.md"
 license = "MIT"
-keywords = ["tui", "terminal", "scp", "rsync", "ssh"]
+keywords = ["tui", "terminal", "sync", "rsync", "ssh"]
 categories = ["command-line-utilities", "development-tools"]
-repository = "https://github.com/FanFusion/lzscp"
+repository = "https://github.com/FanFusion/lzsync"
 authors = ["FanFusion"]
 
 [[bin]]
-name = "lzscp"
+name = "lzsync"
 path = "src/main.rs"
 
 [dependencies]
@@ -36,6 +36,9 @@ regex = "1"
 anyhow = "1"
 thiserror = "2"
 unicode-width = "0.2.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.8"
