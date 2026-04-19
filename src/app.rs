@@ -145,15 +145,14 @@ pub struct HitRegions {
     pub targets_panel: Rect,
     pub target_rows: Vec<Rect>,
     pub progress_panel: Rect,
-    /// Clickable completed transfers — (area, transfer_id)
-    pub progress_rows: Vec<(Rect, u64)>,
+    /// Clickable Activity rows — (area, cursor index into `activity_row_refs`,
+    /// what the row represents).
+    pub activity_rows: Vec<(Rect, usize, ActivityRef)>,
     pub help_bar_hits: Vec<(Rect, HelpBarAction)>,
     pub modal_area: Option<Rect>,
     pub modal_hits: Vec<(Rect, ModalHit)>,
     pub menu_rows: Vec<(Rect, MenuAction)>,
     pub ssh_picker_rows: Vec<Rect>,
-    /// History picker rows — each row maps to an index into the filtered list
-    pub history_rows: Vec<(Rect, usize)>,
 }
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
@@ -191,6 +190,18 @@ pub struct SshPicker {
     pub cursor: usize,
 }
 
+/// Identity of a row rendered in the Activity panel. Lets the key handler
+/// act on the renderer's exact ordering (live transfers first, then merged
+/// history groups).
+#[derive(Debug, Clone)]
+pub enum ActivityRef {
+    Live(u64),
+    /// Index into the filtered history list; refers to the REPRESENTATIVE
+    /// entry of a merged group (same remote_path collapses multiple targets
+    /// into one row).
+    History(usize),
+}
+
 pub struct App {
     pub cfg: Config,
     pub mode: SyncMode,
@@ -219,6 +230,14 @@ pub struct App {
     /// None = inactive. Some("") = filter bar visible but no query. Some(q) =
     /// filtering the activity list by q. Lives with Focus::Progress.
     pub activity_filter: Option<String>,
+    /// Cursor index into the combined Activity row list (live transfers
+    /// first, then merged history groups). Clamped every frame by the
+    /// renderer so it can never point past the end.
+    pub activity_cursor: usize,
+    /// Remote path text currently on the system clipboard. Rendered as a
+    /// persistent `📋 on clipboard` suffix on any Activity row whose
+    /// remote_path matches, so you can always tell what's about to paste.
+    pub last_copied_remote: Option<String>,
     pub history: HistoryStore,
 
     pub update_status: UpdateStatus,
@@ -288,6 +307,8 @@ impl App {
             menu_cursor: 0,
             ssh_picker: None,
             activity_filter: None,
+            activity_cursor: 0,
+            last_copied_remote: None,
             history: HistoryStore::load().unwrap_or_default(),
             update_status: UpdateStatus::Idle,
             hit_regions: HitRegions::default(),
@@ -563,19 +584,16 @@ impl App {
             }
         }
 
-        // Activity row click → live transfer rows copy on completion, history
-        // rows re-render the clipboard text for that entry.
-        for (r, id) in self.hit_regions.progress_rows.clone() {
+        // Activity row click → copy the row's remote path and move the
+        // cursor to it so the highlight reflects what's on the clipboard.
+        for (r, cursor_idx, act) in self.hit_regions.activity_rows.clone() {
             if rect_contains(r, x, y) {
                 self.focus = Focus::Progress;
-                self.recopy_completed(id);
-                return;
-            }
-        }
-        for (r, idx) in self.hit_regions.history_rows.clone() {
-            if rect_contains(r, x, y) {
-                self.focus = Focus::Progress;
-                self.copy_history_by_index(idx);
+                self.activity_cursor = cursor_idx;
+                match act {
+                    ActivityRef::Live(id) => self.recopy_completed(id),
+                    ActivityRef::History(idx) => self.copy_history_by_index(idx),
+                }
                 return;
             }
         }
@@ -752,7 +770,13 @@ impl App {
                     self.toggle_target_cursor();
                 }
             }
-            KeyCode::Enter => self.start_queue_sync(),
+            KeyCode::Enter => {
+                if self.focus == Focus::Progress {
+                    self.copy_activity_cursor();
+                } else {
+                    self.start_queue_sync();
+                }
+            }
             KeyCode::Delete | KeyCode::Backspace if self.focus == Focus::DropZone => {
                 if !self.queue.is_empty() && self.queue_cursor < self.queue.len() {
                     self.queue.remove(self.queue_cursor);
@@ -854,15 +878,88 @@ impl App {
         } else {
             entry.remote_path.clone()
         };
+        self.write_clipboard_text(text, Some(entry.remote_path));
+    }
+
+    /// Write `text` to the system clipboard, update the toast, and remember
+    /// which remote path it corresponds to so the Activity panel can mark
+    /// that row with a persistent "on clipboard" badge.
+    fn write_clipboard_text(&mut self, text: String, remote_path: Option<String>) {
         match crate::clipboard::write(&text) {
             Ok(()) => {
                 self.last_clipboard = Some(text.clone());
+                self.last_copied_remote = remote_path;
                 self.toast(&format!("clipboard ← {}", trunc(&text, 60)));
             }
             Err(e) => {
                 self.toast(&format!("clipboard error: {e}"));
             }
         }
+    }
+
+    /// Keyboard: copy whichever Activity row the cursor is on. Indices are
+    /// resolved against the exact ordering the renderer produced last frame
+    /// via `activity_row_refs`.
+    pub fn copy_activity_cursor(&mut self) {
+        let refs = self.activity_row_refs();
+        if refs.is_empty() {
+            return;
+        }
+        let cursor = self.activity_cursor.min(refs.len() - 1);
+        match refs[cursor].clone() {
+            ActivityRef::Live(id) => self.recopy_completed(id),
+            ActivityRef::History(idx) => self.copy_history_by_index(idx),
+        }
+    }
+
+    /// Compute the row-identity list the Activity renderer uses. Lives in
+    /// app.rs so the key handler (no access to the UI module) can resolve
+    /// the cursor position the same way.
+    pub fn activity_row_refs(&self) -> Vec<ActivityRef> {
+        let q = self.activity_query();
+        let q_lower = q.to_lowercase();
+        let mut out = Vec::new();
+        // Live = anything not yet in history.
+        for t in self.transfers.iter().rev() {
+            if t.state == TransferState::Completed {
+                continue;
+            }
+            if !q_lower.is_empty() {
+                let fname = t
+                    .local
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if !fname.to_lowercase().contains(&q_lower)
+                    && !t.target_name.to_lowercase().contains(&q_lower)
+                {
+                    continue;
+                }
+            }
+            out.push(ActivityRef::Live(t.id));
+        }
+        // History — merged by remote_path. The rep is the FIRST (newest)
+        // entry seen for a given remote_path in the filtered list.
+        let matches = self.history.filter(&q);
+        let mut seen: std::collections::HashMap<String, ()> = std::collections::HashMap::new();
+        for (i, e) in matches.iter().enumerate() {
+            if seen.contains_key(&e.remote_path) {
+                continue;
+            }
+            seen.insert(e.remote_path.clone(), ());
+            out.push(ActivityRef::History(i));
+        }
+        out
+    }
+
+    pub fn move_activity_cursor(&mut self, delta: i32) {
+        let n = self.activity_row_refs().len();
+        if n == 0 {
+            self.activity_cursor = 0;
+            return;
+        }
+        let cur = self.activity_cursor.min(n - 1) as i32;
+        self.activity_cursor = (cur + delta).rem_euclid(n as i32) as usize;
     }
 
     fn open_ssh_picker(&mut self) {
@@ -1144,7 +1241,7 @@ impl App {
                 let next = (self.target_cursor as i32 + delta).rem_euclid(len);
                 self.target_cursor = next as usize;
             }
-            Focus::Progress => {}
+            Focus::Progress => self.move_activity_cursor(delta),
         }
     }
 
@@ -1360,15 +1457,15 @@ impl App {
             self.clipboard_format,
             &self.cfg.clipboard_template,
         );
-        match crate::clipboard::write(&text) {
-            Ok(()) => {
-                self.last_clipboard = Some(text.clone());
-                self.toast(&format!("clipboard ← {}", trunc(&text, 60)));
-            }
-            Err(e) => {
-                self.toast(&format!("clipboard error: {e}"));
-            }
-        }
+        let remote_path = format!(
+            "{}/{}",
+            remote_abs_dir.trim_end_matches('/'),
+            local
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        );
+        self.write_clipboard_text(text, Some(remote_path));
     }
 
     fn toast(&mut self, msg: &str) {

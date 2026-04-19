@@ -37,6 +37,7 @@ pub enum TransferEvent {
     },
 }
 
+#[derive(Debug, Clone)]
 pub struct Transfer {
     #[allow(dead_code)]
     pub id: u64,

@@ -7,7 +7,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{
-    App, Focus, HelpBarAction, HitRegions, ModalHit, TargetKind, TargetStatus, UpdateStatus,
+    ActivityRef, App, Focus, HelpBarAction, HitRegions, ModalHit, TargetKind, TargetStatus,
+    UpdateStatus,
 };
 use crate::history::HistoryEntry;
 use crate::target::SyncMode;
@@ -606,9 +607,10 @@ fn draw_targets(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette
     f.render_widget(List::new(items).block(block), area);
 }
 
-/// Unified Activity panel: live transfers at the top, then history rows
-/// (click any to re-copy the remote path, `/` to filter). Each row is a
-/// single hard-width line so long CJK/emoji names can never overflow.
+/// Unified Activity panel: live transfers at the top, then history groups
+/// (same remote_path collapsed into one row). Click or cursor+Enter copies
+/// the row's remote path; the last-copied row keeps a `📋 on clipboard`
+/// badge so the user always knows what's in the paste buffer.
 fn draw_activity(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
     let focused = app.focus == Focus::Progress;
     let filter_active = app.activity_filter.is_some();
@@ -616,7 +618,7 @@ fn draw_activity(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palett
 
     // Live = anything not yet recorded in history (record_history only runs
     // on Completed, so Completed rows migrate to history automatically).
-    let live: Vec<&Transfer> = app
+    let live: Vec<Transfer> = app
         .transfers
         .iter()
         .rev()
@@ -632,19 +634,24 @@ fn draw_activity(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palett
                 .unwrap_or_default();
             fname.to_lowercase().contains(&query) || t.target_name.to_lowercase().contains(&query)
         })
+        .cloned()
         .collect();
-    let history_matches: Vec<HistoryEntry> = app
+
+    // History: filter, then group by remote_path (same file on 2 hosts = 1
+    // row with both target names joined). Preserve newest-first order.
+    let raw: Vec<HistoryEntry> = app
         .history
         .filter(&app.activity_query())
         .into_iter()
         .cloned()
         .collect();
+    let groups: Vec<HistoryGroup> = group_history(&raw);
 
     let title = if filter_active {
         Line::from(vec![
             Span::raw(" Activity "),
             Span::styled(
-                format!("· {} shown ", live.len() + history_matches.len()),
+                format!("· {} shown ", live.len() + groups.len()),
                 Style::default().fg(p.muted),
             ),
         ])
@@ -702,7 +709,7 @@ fn draw_activity(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palett
         y_off += 1;
     }
 
-    if live.is_empty() && history_matches.is_empty() {
+    if live.is_empty() && groups.is_empty() {
         if y_off < inner.height {
             let hint = if filter_active {
                 "  no matches"
@@ -718,44 +725,117 @@ fn draw_activity(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palett
         return;
     }
 
+    // Clamp cursor and precompute "last copied" marker.
+    let total_rows = live.len() + groups.len();
+    if app.activity_cursor >= total_rows {
+        app.activity_cursor = total_rows.saturating_sub(1);
+    }
+    let copied_marker = app.last_copied_remote.clone();
+
+    let mut cursor_idx: usize = 0;
+
     // Live section.
     for t in &live {
         if y_off >= inner.height {
             break;
         }
         let y = inner.y + y_off;
-        let line = render_live_line(t, inner_w, p);
+        let is_cursor = focused && cursor_idx == app.activity_cursor;
+        let is_copied = copied_marker
+            .as_ref()
+            .map(|cp| live_remote_matches(t, cp))
+            .unwrap_or(false);
+        let line = render_live_line(t, inner_w, p, is_cursor, is_copied);
         let rect = Rect::new(inner.x, y, inner.width, 1);
         f.render_widget(Paragraph::new(line).style(Style::default().bg(p.bg)), rect);
-        app.hit_regions.progress_rows.push((rect, t.id));
+        app.hit_regions
+            .activity_rows
+            .push((rect, cursor_idx, ActivityRef::Live(t.id)));
+        cursor_idx += 1;
         y_off += 1;
     }
 
-    // Thin divider if both sections are present and there's room.
-    if !live.is_empty() && !history_matches.is_empty() && y_off < inner.height && inner.height > 2 {
-        // Skip — no divider needed; the transfers-vs-history distinction is
-        // implicit in the icon colour (● running/✗ failed vs ✓ past).
-    }
-
-    // History section.
-    for (i, e) in history_matches.iter().enumerate() {
+    // History groups.
+    for g in &groups {
         if y_off >= inner.height {
             break;
         }
         let y = inner.y + y_off;
-        let line = render_history_line(e, inner_w, p);
+        let is_cursor = focused && cursor_idx == app.activity_cursor;
+        let is_copied = copied_marker
+            .as_ref()
+            .map(|cp| cp == &g.primary.remote_path)
+            .unwrap_or(false);
+        let line = render_history_group_line(g, inner_w, p, is_cursor, is_copied);
         let rect = Rect::new(inner.x, y, inner.width, 1);
         f.render_widget(Paragraph::new(line).style(Style::default().bg(p.bg)), rect);
-        app.hit_regions.history_rows.push((rect, i));
+        app.hit_regions
+            .activity_rows
+            .push((rect, cursor_idx, ActivityRef::History(g.primary_idx)));
+        cursor_idx += 1;
         y_off += 1;
     }
 }
 
-const TARGET_COL: usize = 10;
+/// Merged history row. `primary` is the newest entry for this remote_path;
+/// `targets` collects every target that's synced the same file to the same
+/// absolute remote path (usually one or two, occasionally more).
+struct HistoryGroup {
+    primary: HistoryEntry,
+    /// Index of `primary` in the filtered history list (what
+    /// `App::history.filter(query)` returns). Matches `ActivityRef::History`.
+    primary_idx: usize,
+    targets: Vec<String>,
+}
+
+fn group_history(matches: &[HistoryEntry]) -> Vec<HistoryGroup> {
+    use std::collections::HashMap;
+    let mut map: HashMap<String, usize> = HashMap::new();
+    let mut out: Vec<HistoryGroup> = Vec::new();
+    for (i, e) in matches.iter().enumerate() {
+        match map.get(&e.remote_path).copied() {
+            Some(gi) => {
+                if !out[gi].targets.contains(&e.target_name) {
+                    out[gi].targets.push(e.target_name.clone());
+                }
+            }
+            None => {
+                map.insert(e.remote_path.clone(), out.len());
+                out.push(HistoryGroup {
+                    primary: e.clone(),
+                    primary_idx: i,
+                    targets: vec![e.target_name.clone()],
+                });
+            }
+        }
+    }
+    out
+}
+
+fn live_remote_matches(t: &Transfer, expected_remote: &str) -> bool {
+    if t.remote_abs_dir.is_empty() {
+        return false;
+    }
+    let name = match t.local.file_name() {
+        Some(n) => n.to_string_lossy().into_owned(),
+        None => return false,
+    };
+    let joined = format!("{}/{}", t.remote_abs_dir.trim_end_matches('/'), name);
+    joined == expected_remote
+}
+
+const TARGET_COL: usize = 14;
 const LEFT_FIXED: usize = 1 /*sp*/ + 1 /*icon*/ + 2 /*sp*/ + TARGET_COL + 2; /*sp*/
 const RIGHT_GUTTER: usize = 2;
+const COPIED_BADGE: &str = " 📋 on clipboard";
 
-fn render_live_line(t: &Transfer, inner_w: usize, p: &theme::Palette) -> Line<'static> {
+fn render_live_line(
+    t: &Transfer,
+    inner_w: usize,
+    p: &theme::Palette,
+    is_cursor: bool,
+    is_copied: bool,
+) -> Line<'static> {
     let (icon, icon_color) = match t.state {
         TransferState::Running => ("●", p.accent),
         TransferState::Pending => ("·", p.muted),
@@ -763,7 +843,6 @@ fn render_live_line(t: &Transfer, inner_w: usize, p: &theme::Palette) -> Line<'s
         TransferState::Completed => ("✓", p.diff_add),
     };
     let target = pad_or_trunc(&t.target_name, TARGET_COL);
-
     let right = match t.state {
         TransferState::Running => {
             if t.rate.is_empty() {
@@ -802,22 +881,42 @@ fn render_live_line(t: &Transfer, inner_w: usize, p: &theme::Palette) -> Line<'s
         right_style,
         inner_w,
         p,
+        is_cursor,
+        is_copied,
     )
 }
 
-fn render_history_line(e: &HistoryEntry, inner_w: usize, p: &theme::Palette) -> Line<'static> {
-    let target = pad_or_trunc(&e.target_name, TARGET_COL);
-    let right = crate::history::format_time_ago(e.synced_at);
+fn render_history_group_line(
+    g: &HistoryGroup,
+    inner_w: usize,
+    p: &theme::Palette,
+    is_cursor: bool,
+    is_copied: bool,
+) -> Line<'static> {
+    let target_label = if g.targets.len() == 1 {
+        g.targets[0].clone()
+    } else {
+        let joined = g.targets.join(",");
+        if display_width(&joined) <= TARGET_COL {
+            joined
+        } else {
+            format!("{} hosts", g.targets.len())
+        }
+    };
+    let target = pad_or_trunc(&target_label, TARGET_COL);
+    let right = crate::history::format_time_ago(g.primary.synced_at);
     build_row_line(
         "✓",
         p.diff_add,
         target,
-        e.local_name.clone(),
+        g.primary.local_name.clone(),
         p.fg,
         right,
         Style::default().fg(p.muted),
         inner_w,
         p,
+        is_cursor,
+        is_copied,
     )
 }
 
@@ -832,34 +931,70 @@ fn build_row_line(
     right_style: Style,
     inner_w: usize,
     p: &theme::Palette,
+    is_cursor: bool,
+    is_copied: bool,
 ) -> Line<'static> {
+    let badge_w = if is_copied {
+        display_width(COPIED_BADGE)
+    } else {
+        0
+    };
     let right_w = display_width(&right);
     let fname_budget = inner_w
         .saturating_sub(LEFT_FIXED)
-        .saturating_sub(right_w + RIGHT_GUTTER);
+        .saturating_sub(right_w + badge_w + RIGHT_GUTTER);
     let name = truncate_cols(&filename, fname_budget.max(3));
     let name_w = display_width(&name);
     let pad = inner_w
-        .saturating_sub(LEFT_FIXED + name_w + right_w + RIGHT_GUTTER)
+        .saturating_sub(LEFT_FIXED + name_w + right_w + badge_w + RIGHT_GUTTER)
         .max(1);
 
-    Line::from(vec![
-        Span::raw(" "),
-        Span::styled(
-            icon.to_string(),
-            Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            target,
-            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(name, Style::default().fg(name_fg)),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(right, right_style),
-        Span::raw("  "),
-    ])
+    // The cursor row is highlighted by flipping the whole row's background
+    // to the selection colour and bolding the text, matching the Targets
+    // panel's selected-row treatment.
+    let (bg_style, name_style) = if is_cursor {
+        let bg = Style::default().bg(p.selection);
+        (
+            bg,
+            Style::default()
+                .fg(name_fg)
+                .bg(p.selection)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (Style::default(), Style::default().fg(name_fg))
+    };
+    let target_style = Style::default()
+        .fg(p.accent)
+        .add_modifier(Modifier::BOLD)
+        .patch(bg_style);
+    let icon_style = Style::default()
+        .fg(icon_color)
+        .add_modifier(Modifier::BOLD)
+        .patch(bg_style);
+    let muted_bg = Style::default().patch(bg_style);
+    let right_style_bg = right_style.patch(bg_style);
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(10);
+    spans.push(Span::styled(" ", muted_bg));
+    spans.push(Span::styled(icon.to_string(), icon_style));
+    spans.push(Span::styled("  ", muted_bg));
+    spans.push(Span::styled(target, target_style));
+    spans.push(Span::styled("  ", muted_bg));
+    spans.push(Span::styled(name, name_style));
+    spans.push(Span::styled(" ".repeat(pad), muted_bg));
+    spans.push(Span::styled(right, right_style_bg));
+    if is_copied {
+        spans.push(Span::styled(
+            COPIED_BADGE,
+            Style::default()
+                .fg(p.accent)
+                .add_modifier(Modifier::BOLD)
+                .patch(bg_style),
+        ));
+    }
+    spans.push(Span::styled("  ", muted_bg));
+    Line::from(spans)
 }
 
 fn draw_help_bar(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
