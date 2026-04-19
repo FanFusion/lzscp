@@ -64,6 +64,95 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     if app.watch_form.is_some() {
         draw_watch_form(f, size, app, &palette);
     }
+    if !app.collision_queue.is_empty() {
+        draw_collision_modal(f, size, app, &palette);
+    }
+}
+
+fn draw_collision_modal(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
+    let Some(pc) = app.collision_queue.front() else {
+        return;
+    };
+    let local_name = pc
+        .local
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "?".into());
+    let subdir_hint = pc
+        .subdir
+        .as_ref()
+        .map(|s| format!("/{s}"))
+        .unwrap_or_default();
+    let remote_hint = format!(
+        "{}:{}{subdir_hint}/{local_name}",
+        pc.target.name, pc.target.remote_dir
+    );
+
+    let w = 72.min(area.width.saturating_sub(4));
+    let h = 12.min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+    f.render_widget(Clear, rect);
+
+    let queued = app.collision_queue.len();
+    let title = if queued > 1 {
+        format!(" Remote file exists (1 of {queued}) ")
+    } else {
+        " Remote file exists ".to_string()
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.diff_del))
+        .style(Style::default().bg(p.bg).fg(p.fg));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let lines: Vec<Line<'static>> = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled(remote_hint, Style::default().fg(p.fg)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("   "),
+            Span::styled(
+                "o",
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  overwrite"),
+        ]),
+        Line::from(vec![
+            Span::raw("   "),
+            Span::styled(
+                "s",
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  skip"),
+        ]),
+        Line::from(vec![
+            Span::raw("   "),
+            Span::styled(
+                "r",
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  rename new file → {}", pc.suggested_rename),
+                Style::default().fg(p.fg),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "Esc",
+                Style::default().fg(p.muted).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  cancel", Style::default().fg(p.muted)),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 fn draw_watch_form(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
@@ -1429,8 +1518,8 @@ fn draw_help_bar(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palett
 }
 
 fn draw_help_overlay(f: &mut Frame<'_>, area: Rect, p: &theme::Palette) {
-    let w = 62.min(area.width.saturating_sub(4));
-    let h = 20.min(area.height.saturating_sub(4));
+    let w = 64.min(area.width.saturating_sub(4));
+    let h = 22.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect::new(x, y, w, h);
@@ -1459,6 +1548,8 @@ fn draw_help_overlay(f: &mut Frame<'_>, area: Rect, p: &theme::Palette) {
         Line::from("  click a row        copy that remote path to clipboard"),
         Line::from(""),
         Line::from("  Watch tab: a add · e edit · d delete · r catch up"),
+        Line::from("  Activity:  d delete row · D clear all · y/n confirm"),
+        Line::from("  Collision: o overwrite · s skip · r rename · Esc cancel"),
         Line::from(""),
         Line::from(Span::styled(
             "  All letter shortcuts use Ctrl so nothing in a dragged",

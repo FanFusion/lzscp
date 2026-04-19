@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
 use crossterm::event::{
@@ -31,6 +31,20 @@ pub enum AppEvent {
     RsyncVersionWarning(String),
     /// Emitted by a running folder-watch poller.
     WatchUpdate(WatchEvent),
+    /// Result of a preflight ssh test for an existing remote file. When
+    /// `exists == true` and `confirm_remote_overwrite` is on, the app pops
+    /// a modal; otherwise the transfer is started immediately.
+    CollisionCheckResult(CollisionCheckResult),
+}
+
+#[derive(Debug, Clone)]
+pub struct CollisionCheckResult {
+    pub local: PathBuf,
+    pub target: crate::target::Target,
+    pub subdir: Option<String>,
+    pub source_watch: Option<String>,
+    pub exists: bool,
+    pub suggested_rename: Option<String>,
 }
 
 /// Which top-level tab is in focus.
@@ -285,6 +299,25 @@ pub enum WatchFormMode {
     Edit(usize), // index into App::watches
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingCollision {
+    pub local: PathBuf,
+    pub target: crate::target::Target,
+    pub subdir: Option<String>,
+    pub source_watch: Option<String>,
+    pub suggested_rename: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum HistoryDeleteTarget {
+    /// Delete every history entry whose remote_path matches this string
+    /// (handles the UI row-grouping: one visible row is actually one remote
+    /// path, potentially one entry).
+    One { remote_path: String, label: String },
+    /// Clear the entire store.
+    All { count: usize },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchFormField {
     Name,
@@ -367,6 +400,12 @@ pub struct App {
     /// Some(index) when the user pressed `d` to delete a watch and we're
     /// waiting on `y` to confirm.
     pub watch_delete_confirm: Option<usize>,
+    /// Some(target) when the user pressed `d` / `D` in the Progress panel to
+    /// delete a single history row or clear all history.
+    pub history_delete_confirm: Option<HistoryDeleteTarget>,
+    /// Queue of pending collisions waiting on user resolution via the modal.
+    /// The head of the queue is what the modal shows.
+    pub collision_queue: VecDeque<PendingCollision>,
 
     pub queue: Vec<PathBuf>,
     pub queue_cursor: usize,
@@ -473,6 +512,8 @@ impl App {
             watch_state,
             watch_form: None,
             watch_delete_confirm: None,
+            history_delete_confirm: None,
+            collision_queue: VecDeque::new(),
             queue: vec![],
             queue_cursor: 0,
             last_paste_error: None,
@@ -545,6 +586,7 @@ impl App {
             } => self.apply_remote_install_result(&target_name, result),
             AppEvent::RsyncVersionWarning(msg) => self.toast(&msg),
             AppEvent::WatchUpdate(evt) => self.handle_watch_event(evt),
+            AppEvent::CollisionCheckResult(r) => self.handle_collision_result(r),
         }
     }
 
@@ -1009,6 +1051,33 @@ impl App {
             }
             KeyCode::Char('n') | KeyCode::Esc if self.watch_delete_confirm.is_some() => {
                 self.watch_delete_confirm = None;
+            }
+            // History row delete: `d` deletes the cursor row, `D` clears all.
+            // Confirmation is held in `history_delete_confirm` — y/n/Esc.
+            KeyCode::Char('d') if self.focus == Focus::Progress => {
+                self.arm_delete_history_cursor();
+            }
+            KeyCode::Char('D') if self.focus == Focus::Progress => {
+                self.arm_clear_all_history();
+            }
+            KeyCode::Char('y') if self.history_delete_confirm.is_some() => {
+                self.confirm_history_delete();
+            }
+            KeyCode::Char('n') | KeyCode::Esc if self.history_delete_confirm.is_some() => {
+                self.history_delete_confirm = None;
+            }
+            // Collision resolution modal — consumes the head of the queue.
+            KeyCode::Char('o') if !self.collision_queue.is_empty() => {
+                self.resolve_collision_head(CollisionResolution::Overwrite);
+            }
+            KeyCode::Char('s') if !self.collision_queue.is_empty() => {
+                self.resolve_collision_head(CollisionResolution::Skip);
+            }
+            KeyCode::Char('r') if !self.collision_queue.is_empty() => {
+                self.resolve_collision_head(CollisionResolution::Rename);
+            }
+            KeyCode::Esc if !self.collision_queue.is_empty() => {
+                self.resolve_collision_head(CollisionResolution::Cancel);
             }
             // Space / 1–9 still act as Targets-panel conveniences — they
             // fire ONLY when Targets is focused, so a path dropped into the
@@ -1627,15 +1696,13 @@ impl App {
 
         for file in &files {
             for tname in &ok {
-                let Some(t) = self.cfg.target_by_name(tname) else {
+                let Some(t) = self.cfg.target_by_name(tname).cloned() else {
                     continue;
                 };
-                let id = self.next_transfer_id;
-                self.next_transfer_id += 1;
-                let tr = Transfer::new(id, t, file.clone());
-                self.transfer_index.insert(id, self.transfers.len());
-                self.transfers.push(tr);
-                transfer::spawn(id, t.clone(), file.clone(), None, self.transfer_tx.clone());
+                // Drop-tab transfers have no subdir — files land flat in
+                // target.remote_dir. Preflight decides whether to pop the
+                // collision modal before kicking off rsync.
+                self.preflight_and_start(t, file.clone(), None, None);
             }
         }
         if skipped.is_empty() {
@@ -2235,6 +2302,70 @@ impl App {
         self.persist_config();
     }
 
+    pub fn arm_delete_history_cursor(&mut self) {
+        let refs = self.activity_row_refs();
+        if refs.is_empty() {
+            self.toast("no history to delete");
+            return;
+        }
+        let cursor = self.activity_cursor.min(refs.len() - 1);
+        match &refs[cursor] {
+            ActivityRef::Live(_) => {
+                self.toast("can't delete a live transfer — wait until it finishes");
+            }
+            ActivityRef::History(i) => {
+                let matches = self.history.filter(&self.activity_query());
+                let Some(entry) = matches.get(*i) else {
+                    return;
+                };
+                let remote_path = entry.remote_path.clone();
+                let label = format!(
+                    "{} → {}",
+                    entry.local_name.clone(),
+                    entry.target_name.clone()
+                );
+                self.history_delete_confirm = Some(HistoryDeleteTarget::One {
+                    remote_path,
+                    label: label.clone(),
+                });
+                self.toast(&format!("delete '{label}'? y / n / Esc"));
+            }
+        }
+    }
+
+    pub fn arm_clear_all_history(&mut self) {
+        let count = self.history.entries.len();
+        if count == 0 {
+            self.toast("history is already empty");
+            return;
+        }
+        self.history_delete_confirm = Some(HistoryDeleteTarget::All { count });
+        self.toast(&format!("clear {count} history entries? y / n / Esc"));
+    }
+
+    pub fn confirm_history_delete(&mut self) {
+        let Some(target) = self.history_delete_confirm.take() else {
+            return;
+        };
+        match target {
+            HistoryDeleteTarget::One { remote_path, label } => {
+                match self.history.remove_by_remote_path(&remote_path) {
+                    Ok(n) => self.toast(&format!(
+                        "deleted {n} entr{} ({label})",
+                        if n == 1 { "y" } else { "ies" }
+                    )),
+                    Err(e) => self.toast(&format!("delete failed: {e}")),
+                }
+            }
+            HistoryDeleteTarget::All { count } => match self.history.clear_all() {
+                Ok(_) => self.toast(&format!("cleared {count} history entries")),
+                Err(e) => self.toast(&format!("clear failed: {e}")),
+            },
+        }
+        // Cursor may now point past the end — clamp on next tick via move_activity_cursor.
+        self.activity_cursor = 0;
+    }
+
     pub fn arm_delete_current_watch(&mut self) {
         if self.watches.get(self.watch_cursor).is_none() {
             return;
@@ -2304,24 +2435,167 @@ impl App {
 
     fn spawn_watch_transfer(&mut self, watch_name: &str, target_names: &[String], path: PathBuf) {
         for tname in target_names {
-            let Some(target) = self.cfg.target_by_name(tname) else {
+            let Some(target) = self.cfg.target_by_name(tname).cloned() else {
                 continue;
             };
-            let id = self.next_transfer_id;
-            self.next_transfer_id += 1;
-            let transfer =
-                Transfer::new_from_watch(id, target, path.clone(), watch_name.to_string());
-            self.transfer_index.insert(id, self.transfers.len());
-            self.transfers.push(transfer);
-            transfer::spawn(
-                id,
-                target.clone(),
+            self.preflight_and_start(
+                target,
                 path.clone(),
                 Some(watch_name.to_string()),
-                self.transfer_tx.clone(),
+                Some(watch_name.to_string()),
             );
         }
     }
+
+    /// Fire an async remote existence check. On result the app either starts
+    /// the rsync (no collision or `confirm_remote_overwrite == false`) or
+    /// pushes a modal entry onto `collision_queue`.
+    ///
+    /// `subdir` is the per-watch remote subfolder (e.g. watch name); `None`
+    /// means files land flat in `target.remote_dir`.
+    pub fn preflight_and_start(
+        &mut self,
+        target: crate::target::Target,
+        local: PathBuf,
+        subdir: Option<String>,
+        source_watch: Option<String>,
+    ) {
+        if !self.cfg.confirm_remote_overwrite {
+            // User opted out of preflight — go straight to rsync. rsync will
+            // silently overwrite if remote exists; pre-0.4.5 behavior.
+            self.start_transfer_now(target, local, subdir, source_watch, None);
+            return;
+        }
+        let basename = local
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if basename.is_empty() {
+            // Something odd — no basename. Fall back to direct start.
+            self.start_transfer_now(target, local, subdir, source_watch, None);
+            return;
+        }
+        let tx = self.app_tx.clone();
+        let t2 = target.clone();
+        let l2 = local.clone();
+        let sd2 = subdir.clone();
+        let sw2 = source_watch.clone();
+        tokio::spawn(async move {
+            // On probe failure we proceed as if there were no collision —
+            // rsync will surface any real error to the user directly.
+            let (exists, suggested_rename) =
+                transfer::check_collision(&t2, sd2.as_deref(), &basename)
+                    .await
+                    .unwrap_or_default();
+            let _ = tx.send(AppEvent::CollisionCheckResult(CollisionCheckResult {
+                local: l2,
+                target: t2,
+                subdir: sd2,
+                source_watch: sw2,
+                exists,
+                suggested_rename,
+            }));
+        });
+    }
+
+    fn handle_collision_result(&mut self, r: CollisionCheckResult) {
+        if !r.exists {
+            self.start_transfer_now(r.target, r.local, r.subdir, r.source_watch, None);
+            return;
+        }
+        let suggested_rename = r.suggested_rename.unwrap_or_else(|| {
+            r.local
+                .file_name()
+                .map(|s| format!("{}.new", s.to_string_lossy()))
+                .unwrap_or_else(|| "unnamed.new".to_string())
+        });
+        self.collision_queue.push_back(PendingCollision {
+            local: r.local,
+            target: r.target,
+            subdir: r.subdir,
+            source_watch: r.source_watch,
+            suggested_rename,
+        });
+        // Ambient toast so the user notices the modal appeared, especially
+        // when triggered by a background watch poller.
+        if self.collision_queue.len() == 1 {
+            self.toast("remote file exists — press o / s / r / Esc");
+        }
+    }
+
+    fn resolve_collision_head(&mut self, resolution: CollisionResolution) {
+        let Some(pc) = self.collision_queue.pop_front() else {
+            return;
+        };
+        match resolution {
+            CollisionResolution::Overwrite => {
+                self.start_transfer_now(pc.target, pc.local, pc.subdir, pc.source_watch, None);
+            }
+            CollisionResolution::Rename => {
+                let rename = pc.suggested_rename.clone();
+                self.start_transfer_now(
+                    pc.target,
+                    pc.local,
+                    pc.subdir,
+                    pc.source_watch,
+                    Some(rename),
+                );
+            }
+            CollisionResolution::Skip => {
+                self.toast(&format!(
+                    "skipped {} → {}",
+                    pc.local
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "?".into()),
+                    pc.target.name
+                ));
+            }
+            CollisionResolution::Cancel => {
+                // Same as Skip — just don't emit a toast so a queue flush via
+                // repeated Esc doesn't spam.
+            }
+        }
+    }
+
+    fn start_transfer_now(
+        &mut self,
+        target: crate::target::Target,
+        local: PathBuf,
+        subdir: Option<String>,
+        source_watch: Option<String>,
+        rename_to: Option<String>,
+    ) {
+        let id = self.next_transfer_id;
+        self.next_transfer_id += 1;
+        let transfer = if let Some(w) = source_watch.as_ref() {
+            Transfer::new_from_watch(id, &target, local.clone(), w.clone())
+        } else {
+            Transfer::new(id, &target, local.clone())
+        };
+        self.transfer_index.insert(id, self.transfers.len());
+        self.transfers.push(transfer);
+        if let Some(rename) = rename_to {
+            transfer::spawn_with_rename(
+                id,
+                target,
+                local,
+                subdir,
+                rename,
+                self.transfer_tx.clone(),
+            );
+        } else {
+            transfer::spawn(id, target, local, subdir, self.transfer_tx.clone());
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CollisionResolution {
+    Overwrite,
+    Skip,
+    Rename,
+    Cancel,
 }
 
 impl WatchUi {

@@ -23,6 +23,11 @@ pub struct Config {
     pub groups: Vec<Group>,
     #[serde(default, rename = "watch")]
     pub watches: Vec<WatchConfig>,
+    /// When true (default), lzsync checks whether the remote file exists
+    /// before rsyncing and pops a confirm modal so the user can overwrite /
+    /// skip / rename. Set to false to restore pre-0.4.5 unconditional behavior.
+    #[serde(default = "default_confirm_remote_overwrite")]
+    pub confirm_remote_overwrite: bool,
     #[serde(skip)]
     pub source: ConfigSource,
     /// Non-persisted notice shown to the user via a toast on first launch
@@ -43,6 +48,10 @@ fn default_clipboard_template() -> String {
     "{user}@{host}:{path}".to_string()
 }
 
+fn default_confirm_remote_overwrite() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -54,6 +63,7 @@ impl Default for Config {
             targets: vec![],
             groups: vec![],
             watches: vec![],
+            confirm_remote_overwrite: true,
             source: ConfigSource::Default,
             migration_notice: None,
         }

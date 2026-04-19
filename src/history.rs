@@ -129,6 +129,73 @@ impl HistoryStore {
         Ok(())
     }
 
+    /// Remove every entry whose remote_path matches `remote_path`, then
+    /// rewrite the affected target JSONL files so the change survives a
+    /// reload. Same-filename-fanned-out-to-multiple-targets is intentionally
+    /// handled per-target — different targets have different remote_paths,
+    /// so only the one visible row is removed.
+    pub fn remove_by_remote_path(&mut self, remote_path: &str) -> Result<usize> {
+        let to_remove: Vec<HistoryEntry> = self
+            .entries
+            .iter()
+            .filter(|e| e.remote_path == remote_path)
+            .cloned()
+            .collect();
+        if to_remove.is_empty() {
+            return Ok(0);
+        }
+        let removed_count = to_remove.len();
+        self.entries.retain(|e| e.remote_path != remote_path);
+        // Rewrite each affected target's JSONL.
+        let targets: std::collections::HashSet<String> =
+            to_remove.iter().map(|e| e.target_name.clone()).collect();
+        for t in &targets {
+            self.rewrite_target_file(t)?;
+        }
+        Ok(removed_count)
+    }
+
+    /// Clear the entire history store — blows away every JSONL in `base`.
+    pub fn clear_all(&mut self) -> Result<usize> {
+        let count = self.entries.len();
+        self.entries.clear();
+        if self.base.exists() {
+            for entry in std::fs::read_dir(&self.base)? {
+                let entry = entry?;
+                let p = entry.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    fn rewrite_target_file(&self, target: &str) -> Result<()> {
+        let path = self
+            .base
+            .join(format!("{}.jsonl", sanitize_filename(target)));
+        // Collect all surviving entries for this target.
+        let remaining: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| e.target_name == target)
+            .map(|e| serde_json::to_string(e).unwrap_or_default())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if remaining.is_empty() {
+            // Nothing left — delete the file so load() doesn't see stale lines.
+            let _ = std::fs::remove_file(&path);
+            return Ok(());
+        }
+        let tmp = path.with_extension("jsonl.tmp");
+        let mut body = remaining.join("\n");
+        body.push('\n');
+        std::fs::write(&tmp, body).with_context(|| format!("write {tmp:?}"))?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("rename {tmp:?} -> {path:?}"))?;
+        Ok(())
+    }
+
     /// Case-insensitive substring filter over local_name, local_path, and
     /// target_name. Empty query returns everything.
     pub fn filter(&self, query: &str) -> Vec<&HistoryEntry> {
@@ -288,6 +355,42 @@ mod tests {
         assert_eq!(sanitize_filename("dev/jp"), "dev_jp");
         assert_eq!(sanitize_filename("a@b"), "a_b");
         assert_eq!(sanitize_filename("ok-name_1"), "ok-name_1");
+    }
+
+    #[test]
+    fn remove_by_remote_path_filters_file_and_memory() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = HistoryStore::load_from(tmp.path()).unwrap();
+        store
+            .append(entry("/a/shot.png", "dev", "/r/shot.png", 100))
+            .unwrap();
+        store
+            .append(entry("/a/shot.png", "dev", "/r/shot.png", 200))
+            .unwrap(); // Same key, later mtime → supersedes on reload.
+        store
+            .append(entry("/a/other.png", "dev", "/r/other.png", 300))
+            .unwrap();
+        let removed = store.remove_by_remote_path("/r/shot.png").unwrap();
+        assert!(removed >= 1);
+        let reloaded = HistoryStore::load_from(tmp.path()).unwrap();
+        assert_eq!(reloaded.entries.len(), 1);
+        assert_eq!(reloaded.entries[0].remote_path, "/r/other.png");
+    }
+
+    #[test]
+    fn clear_all_wipes_everything() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = HistoryStore::load_from(tmp.path()).unwrap();
+        store
+            .append(entry("/a/shot.png", "dev", "/r/shot.png", 100))
+            .unwrap();
+        store
+            .append(entry("/a/other.pdf", "devjp", "/r/other.pdf", 200))
+            .unwrap();
+        let n = store.clear_all().unwrap();
+        assert_eq!(n, 2);
+        let reloaded = HistoryStore::load_from(tmp.path()).unwrap();
+        assert!(reloaded.entries.is_empty());
     }
 
     #[test]

@@ -388,6 +388,187 @@ async fn resolve_remote_home(target: &Target, subdir: Option<&str>) -> Result<St
     Ok(resolved)
 }
 
+/// Check whether `<remote_dir>/<subdir>/<basename>` exists on `target`, and
+/// if it does, return a suggested rename — the first free `basename-N.ext`
+/// in the same directory. One SSH round-trip answers both questions.
+///
+/// Returns `(exists, Some(rename) if exists else None)`.
+pub async fn check_collision(
+    target: &Target,
+    subdir: Option<&str>,
+    basename: &str,
+) -> Result<(bool, Option<String>)> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("BatchMode=yes");
+    cmd.arg("-o").arg("ConnectTimeout=10");
+    cmd.arg("-p").arg(target.ssh_port().to_string());
+    if let Some(key) = &target.ssh_key {
+        let expanded = shellexpand::tilde(key);
+        cmd.arg("-i").arg(expanded.as_ref());
+    }
+    let addr = match &target.user {
+        Some(u) => format!("{u}@{}", target.host),
+        None => target.host.clone(),
+    };
+    cmd.arg(addr);
+
+    // Build the destination dir on the remote (same script as resolve_remote_home,
+    // minus the mkdir for perf — presence check shouldn't create). If the dir
+    // doesn't exist yet the file can't exist, so we report no-collision.
+    //
+    // Returns one of:
+    //   MISS            — file does not exist
+    //   HIT <rename>    — file exists, `rename` is first free suffix variant
+    let script = match subdir {
+        Some(sub) => format!(
+            r#"d={remote}; d="${{d/#~/$HOME}}"; t="$d"/{sub}; base={base}; stem="${{base%.*}}"; ext="${{base##*.}}"; if [ "$base" = "$ext" ]; then ext=""; else ext=".$ext"; fi; if [ -e "$t/$base" ]; then n=1; while [ -e "$t/$stem-$n$ext" ]; do n=$((n+1)); done; echo "HIT $stem-$n$ext"; else echo MISS; fi"#,
+            remote = shell_single_quote(&target.remote_dir),
+            sub = shell_single_quote(sub),
+            base = shell_single_quote(basename),
+        ),
+        None => format!(
+            r#"d={remote}; d="${{d/#~/$HOME}}"; t="$d"; base={base}; stem="${{base%.*}}"; ext="${{base##*.}}"; if [ "$base" = "$ext" ]; then ext=""; else ext=".$ext"; fi; if [ -e "$t/$base" ]; then n=1; while [ -e "$t/$stem-$n$ext" ]; do n=$((n+1)); done; echo "HIT $stem-$n$ext"; else echo MISS; fi"#,
+            remote = shell_single_quote(&target.remote_dir),
+            base = shell_single_quote(basename),
+        ),
+    };
+    cmd.arg(script);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let output = cmd.output().await.context("ssh collision check")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "ssh collision check failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if out == "MISS" {
+        Ok((false, None))
+    } else if let Some(rest) = out.strip_prefix("HIT ") {
+        Ok((true, Some(rest.to_string())))
+    } else {
+        // Unknown — play safe: assume collision so we prompt.
+        Ok((true, Some(format!("{basename}.new"))))
+    }
+}
+
+/// Spawn rsync with an explicit destination filename (used by the "rename
+/// on collision" flow — rsync's default destination is the same basename).
+pub fn spawn_with_rename(
+    id: u64,
+    target: Target,
+    local: PathBuf,
+    subdir: Option<String>,
+    dest_basename: String,
+    tx: mpsc::UnboundedSender<TransferEvent>,
+) {
+    tokio::spawn(async move {
+        if let Err(e) =
+            run_rename(id, &target, &local, subdir.as_deref(), &dest_basename, &tx).await
+        {
+            let _ = tx.send(TransferEvent::Failed {
+                id,
+                error: format!("{e:#}"),
+            });
+        }
+    });
+}
+
+async fn run_rename(
+    id: u64,
+    target: &Target,
+    local: &Path,
+    subdir: Option<&str>,
+    dest_basename: &str,
+    tx: &mpsc::UnboundedSender<TransferEvent>,
+) -> Result<()> {
+    let _ = tx.send(TransferEvent::Started {
+        id,
+        target_name: target.name.clone(),
+        local: local.to_path_buf(),
+    });
+
+    let remote_abs_dir = resolve_remote_home(target, subdir)
+        .await
+        .with_context(|| format!("resolving remote dir for target '{}'", target.name))?;
+
+    let endpoint = match &target.user {
+        Some(u) => format!("{u}@{}:{}/{}", target.host, remote_abs_dir, dest_basename),
+        None => format!("{}:{}/{}", target.host, remote_abs_dir, dest_basename),
+    };
+
+    let mut ssh_opt = format!("ssh -p {}", target.ssh_port());
+    if let Some(key) = &target.ssh_key {
+        let expanded = shellexpand::tilde(key);
+        ssh_opt.push_str(&format!(" -i {expanded}"));
+    }
+    ssh_opt.push_str(" -o BatchMode=no -o StrictHostKeyChecking=accept-new");
+
+    let mut cmd = Command::new("rsync");
+    cmd.arg("--progress")
+        .arg("--partial")
+        .arg("-r")
+        .arg("-e")
+        .arg(&ssh_opt)
+        .arg(local)
+        .arg(&endpoint)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().context("spawning rsync (rename)")?;
+    let stdout = child.stdout.take().context("rsync stdout pipe")?;
+    let stderr = child.stderr.take().context("rsync stderr pipe")?;
+
+    use std::sync::{Arc, Mutex};
+    let stderr_buf: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+
+    let tx_out = tx.clone();
+    let stdout_task = tokio::spawn(async move {
+        read_progress_stream(id, stdout, tx_out).await;
+    });
+    let tx_err = tx.clone();
+    let stderr_sink = stderr_buf.clone();
+    let stderr_task = tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            {
+                let mut s = stderr_sink.lock().expect("stderr lock");
+                if !s.is_empty() {
+                    s.push('\n');
+                }
+                s.push_str(&line);
+            }
+            let _ = tx_err.send(TransferEvent::Line { id, line });
+        }
+    });
+
+    let status = child.wait().await.context("rsync wait")?;
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+
+    if status.success() {
+        let _ = tx.send(TransferEvent::Completed { id, remote_abs_dir });
+        Ok(())
+    } else {
+        let code = status.code().unwrap_or(-1);
+        let captured = stderr_buf.lock().expect("stderr lock").clone();
+        let detail = if captured.is_empty() {
+            explain_rsync_exit(code).to_string()
+        } else {
+            captured
+                .lines()
+                .rfind(|l| !l.trim().is_empty())
+                .unwrap_or(&captured)
+                .to_string()
+        };
+        let _ = tx.send(TransferEvent::Failed {
+            id,
+            error: format!("rsync exit {code}: {detail}"),
+        });
+        Ok(())
+    }
+}
+
 fn shell_single_quote(s: &str) -> String {
     // Wrap s in single quotes, escaping any embedded single quotes.
     // ' → '\''
