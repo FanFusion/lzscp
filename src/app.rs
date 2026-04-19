@@ -356,11 +356,17 @@ impl WatchFormField {
 /// (which watch produced the event) is preserved.
 #[derive(Debug, Clone)]
 pub struct RecentWatchEvent {
+    #[allow(dead_code)] // kept for future per-watch filtering of the recent list
     pub watch_name: String,
     pub file_display: String,
-    #[allow(dead_code)] // kept for future Activity-row click-to-copy wiring
     pub path: PathBuf,
+    /// Which target this particular transfer went to. When one watch fans
+    /// out to several targets, each transfer lands as its own event; the UI
+    /// groups same-path entries back into one row ("→ dev, devjp").
+    pub target: String,
     pub at: std::time::Instant,
+    /// None = success, Some(msg) = this transfer failed with that message.
+    pub error: Option<String>,
 }
 
 /// Identity of a row rendered in the Activity panel. Lets the key handler
@@ -1761,13 +1767,30 @@ impl App {
                     source_watch.as_deref(),
                 );
                 self.update_clipboard_for_completed(&target_name, &local, &remote_abs_dir);
+                if let Some(w) = source_watch.as_ref() {
+                    self.record_watch_recent(w, &local, &target_name, None);
+                }
             }
             TransferEvent::Failed { id, error } => {
-                if let Some(t) = self.transfer_mut(id) {
-                    t.state = TransferState::Failed;
-                    t.last_error = Some(error.clone());
-                }
+                let (local, target_name, source_watch) = match self.transfer_mut(id) {
+                    Some(t) => {
+                        t.state = TransferState::Failed;
+                        t.last_error = Some(error.clone());
+                        (
+                            t.local.clone(),
+                            t.target_name.clone(),
+                            t.source_watch.clone(),
+                        )
+                    }
+                    None => {
+                        self.toast(&format!("transfer failed: {error}"));
+                        return;
+                    }
+                };
                 self.toast(&format!("transfer failed: {error}"));
+                if let Some(w) = source_watch.as_ref() {
+                    self.record_watch_recent(w, &local, &target_name, Some(error));
+                }
             }
         }
     }
@@ -1775,6 +1798,39 @@ impl App {
     fn transfer_mut(&mut self, id: u64) -> Option<&mut Transfer> {
         let idx = *self.transfer_index.get(&id)?;
         self.transfers.get_mut(idx)
+    }
+
+    /// Record one transfer's outcome in the Watch tab's Recent panel and
+    /// (on success only) bump the per-watch synced counter. The UI groups
+    /// same-path entries at render time so multi-target fan-out collapses
+    /// into one visible row.
+    fn record_watch_recent(
+        &mut self,
+        watch_name: &str,
+        local: &std::path::Path,
+        target_name: &str,
+        error: Option<String>,
+    ) {
+        let file_display = local
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| local.to_string_lossy().into_owned());
+        let is_success = error.is_none();
+        self.watch_recent.insert(
+            0,
+            RecentWatchEvent {
+                watch_name: watch_name.to_string(),
+                file_display,
+                path: local.to_path_buf(),
+                target: target_name.to_string(),
+                at: std::time::Instant::now(),
+                error,
+            },
+        );
+        self.watch_recent.truncate(40);
+        if is_success && let Some(ui) = self.watches.iter_mut().find(|w| w.name == watch_name) {
+            ui.synced_count += 1;
+        }
     }
 
     fn record_history(
@@ -1981,26 +2037,9 @@ impl App {
                 path,
                 size: _,
             } => {
-                let file_display = path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
-                self.watch_recent.insert(
-                    0,
-                    RecentWatchEvent {
-                        watch_name: watch_name.clone(),
-                        file_display,
-                        path: path.clone(),
-                        at: std::time::Instant::now(),
-                    },
-                );
-                // Keep the recent list bounded.
-                self.watch_recent.truncate(20);
-                if let Some(ui) = self.watches.iter_mut().find(|w| w.name == watch_name) {
-                    ui.synced_count += 1;
-                }
-                // Stage 5 will enqueue the file here. For now just enqueue the
-                // path so auto-mode users see it land in Activity too.
+                // Don't record recent/synced_count here — that happens in the
+                // transfer completion handler so failures don't get counted
+                // as successes. Just enqueue for sync.
                 self.enqueue_watch_file(&watch_name, path);
             }
             WatchEvent::CatchupDetected { watch_name, paths } => {

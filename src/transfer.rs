@@ -140,10 +140,16 @@ async fn run(
     // -r is needed for directories — without it rsync silently skips them
     // ("skipping directory foo") and still exits 0, making the UI claim a
     // completed transfer that actually moved nothing.
-    cmd.arg("--progress")
-        .arg("--partial")
-        .arg("-r")
-        .arg("-e")
+    cmd.arg("--progress").arg("--partial").arg("-r");
+    // macOS stores Unicode filenames as NFD (decomposed) on its native FS.
+    // When rsyncing those to a Linux box that expects NFC, certain CJK or
+    // combining sequences fail with rsync exit 23. Convert on the fly.
+    // Requires rsync 3.0+ on the source (Homebrew rsync); macOS's bundled
+    // 2.6.9 lacks --iconv, which is why we warn about old rsync at startup.
+    if cfg!(target_os = "macos") {
+        cmd.arg("--iconv=utf-8-mac,utf-8");
+    }
+    cmd.arg("-e")
         .arg(&ssh_opt)
         .arg(local)
         .arg(&endpoint)

@@ -236,12 +236,12 @@ fn draw_watch_form(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette)
         Style::default().fg(p.muted)
     };
     let catchup_label = match form.catchup {
-        CatchupMode::Prompt => "prompt on restart",
-        CatchupMode::Auto => "auto-sync all newer",
-        CatchupMode::Ignore => "ignore older files",
+        CatchupMode::Prompt => "ask me (r to sync)",
+        CatchupMode::Auto => "auto-sync",
+        CatchupMode::Ignore => "ignore",
     };
     lines.push(Line::from(vec![
-        Span::styled(" Backlog ", c_label_style),
+        Span::styled(" Missing&Old ", c_label_style),
         Span::raw(" "),
         Span::styled(
             format!("⟨ {catchup_label} ⟩"),
@@ -458,7 +458,10 @@ fn render_watch_row<'a>(w: &'a WatchUi, is_cursor: bool, p: &theme::Palette) -> 
         WatchUiStatus::Error(msg) => truncate_cols(msg, 30),
     };
     let tail = if !w.pending_catchup.is_empty() {
-        format!("{base_tail}  ({} new — press r)", w.pending_catchup.len())
+        format!(
+            "{base_tail}  ({} missing/old · r to sync)",
+            w.pending_catchup.len()
+        )
     } else {
         base_tail
     };
@@ -508,22 +511,69 @@ fn draw_watch_recent(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palett
         f.render_widget(msg, inner);
         return;
     }
-    let lines: Vec<Line<'_>> = app
-        .watch_recent
+    // Group same-path events into one row. `watch_recent` is newest-first;
+    // the first time we see a path determines its slot, and older same-path
+    // entries merge into it. Multi-target fan-out thus collapses into one
+    // row that reads "→ dev, devjp".
+    struct Group {
+        at: std::time::Instant,
+        file_display: String,
+        targets: Vec<String>,
+        successes: usize,
+        failures: Vec<String>, // error messages, one per failed target
+    }
+    let mut order: Vec<std::path::PathBuf> = Vec::new();
+    let mut groups: std::collections::HashMap<std::path::PathBuf, Group> =
+        std::collections::HashMap::new();
+    for e in app.watch_recent.iter() {
+        let entry = groups.entry(e.path.clone()).or_insert_with(|| {
+            order.push(e.path.clone());
+            Group {
+                at: e.at,
+                file_display: e.file_display.clone(),
+                targets: Vec::new(),
+                successes: 0,
+                failures: Vec::new(),
+            }
+        });
+        if !entry.targets.iter().any(|t| t == &e.target) {
+            entry.targets.push(e.target.clone());
+        }
+        match &e.error {
+            Some(err) => entry.failures.push(err.clone()),
+            None => entry.successes += 1,
+        }
+    }
+
+    let lines: Vec<Line<'_>> = order
         .iter()
         .take(inner.height as usize)
-        .map(|e| {
-            let ago = humanize_elapsed(e.at);
-            Line::from(vec![
+        .map(|path| {
+            let g = &groups[path];
+            let ago = humanize_elapsed(g.at);
+            let targets_str = g.targets.join(", ");
+            let mut spans = vec![
                 Span::raw(" "),
                 Span::styled("📸", Style::default().fg(p.accent)),
                 Span::raw(" "),
-                Span::styled(pad_or_trunc(&e.file_display, 28), Style::default().fg(p.fg)),
+                Span::styled(pad_or_trunc(&g.file_display, 28), Style::default().fg(p.fg)),
                 Span::raw(" "),
-                Span::styled(format!("→ {}", e.watch_name), Style::default().fg(p.accent)),
+                Span::styled(format!("→ {targets_str}"), Style::default().fg(p.accent)),
                 Span::raw("  "),
                 Span::styled(ago, Style::default().fg(p.muted)),
-            ])
+            ];
+            if !g.failures.is_empty() {
+                let total = g.failures.len() + g.successes;
+                let summary = if g.successes == 0 {
+                    // All targets failed — show the first error so the user
+                    // at least knows what broke.
+                    format!("  ✗ failed: {}", truncate_cols(&g.failures[0], 60))
+                } else {
+                    format!("  ✗ {}/{} failed", g.failures.len(), total)
+                };
+                spans.push(Span::styled(summary, Style::default().fg(p.diff_del)));
+            }
+            Line::from(spans)
         })
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
@@ -1473,16 +1523,28 @@ fn build_row_line(
 }
 
 fn draw_help_bar(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
-    // (key-label, description, click action). ≡ opens the menu which contains
-    // every less-common action, so we keep the bar short.
-    let chips: [(&str, &str, HelpBarAction); 6] = [
-        ("Tab", "focus", HelpBarAction::CycleFocus),
-        ("Enter", "sync", HelpBarAction::Sync),
-        ("^U", "update", HelpBarAction::CheckUpdate),
-        ("^P", "menu", HelpBarAction::OpenMenu),
-        ("^H", "help", HelpBarAction::ToggleHelp),
-        ("^Q", "quit", HelpBarAction::Quit),
-    ];
+    // (key-label, description, click action). Watch tab shows folder-editing
+    // shortcuts; Drop tab shows the transfer workflow shortcuts. ≡ opens the
+    // menu which contains every less-common action, so we keep the bar short.
+    let chips: Vec<(&str, &str, HelpBarAction)> = match app.current_tab {
+        Tab::Drop => vec![
+            ("Tab", "focus", HelpBarAction::CycleFocus),
+            ("Enter", "sync", HelpBarAction::Sync),
+            ("^U", "update", HelpBarAction::CheckUpdate),
+            ("^P", "menu", HelpBarAction::OpenMenu),
+            ("^H", "help", HelpBarAction::ToggleHelp),
+            ("^Q", "quit", HelpBarAction::Quit),
+        ],
+        Tab::Watch => vec![
+            ("a", "add", HelpBarAction::OpenMenu),
+            ("e", "edit", HelpBarAction::OpenMenu),
+            ("Space", "on/off", HelpBarAction::ToggleSelection),
+            ("r", "sync now", HelpBarAction::Sync),
+            ("d", "delete", HelpBarAction::OpenMenu),
+            ("^H", "help", HelpBarAction::ToggleHelp),
+            ("^Q", "quit", HelpBarAction::Quit),
+        ],
+    };
 
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(chips.len() * 3);
     let mut cursor_x = area.x;
