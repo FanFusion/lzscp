@@ -227,6 +227,12 @@ pub struct App {
     pub menu_cursor: usize,
 
     pub ssh_picker: Option<SshPicker>,
+    /// Fallback paste detector: terminals that don't wrap drag-and-drop in
+    /// bracketed paste instead deliver the path as a burst of individual
+    /// char events. When DropZone has focus we accumulate those chars here
+    /// and `tick()` flushes the buffer as a paste after a short idle gap.
+    pub paste_buffer: String,
+    pub paste_buffer_last_char: Option<std::time::Instant>,
     /// None = inactive. Some("") = filter bar visible but no query. Some(q) =
     /// filtering the activity list by q. Lives with Focus::Progress.
     pub activity_filter: Option<String>,
@@ -306,6 +312,8 @@ impl App {
             menu_visible: false,
             menu_cursor: 0,
             ssh_picker: None,
+            paste_buffer: String::new(),
+            paste_buffer_last_char: None,
             activity_filter: None,
             activity_cursor: 0,
             last_copied_remote: None,
@@ -324,6 +332,24 @@ impl App {
             && at.elapsed() > std::time::Duration::from_secs(4)
         {
             self.toast = None;
+        }
+        self.flush_paste_buffer_if_idle();
+    }
+
+    /// If we've buffered chars in DropZone and the stream has gone quiet
+    /// for >= 120ms, treat it as a paste. Anything < 3 chars is almost
+    /// certainly a deliberate keystroke and gets dropped.
+    fn flush_paste_buffer_if_idle(&mut self) {
+        let Some(last) = self.paste_buffer_last_char else {
+            return;
+        };
+        if last.elapsed() < std::time::Duration::from_millis(120) {
+            return;
+        }
+        let buf = std::mem::take(&mut self.paste_buffer);
+        self.paste_buffer_last_char = None;
+        if buf.chars().count() >= 3 {
+            self.handle_paste(&buf);
         }
     }
 
@@ -790,6 +816,24 @@ impl App {
                     self.target_cursor = idx;
                     self.toggle_target_cursor();
                 }
+            }
+            // Fallback paste detector: in DropZone, any burst of unmodified
+            // printable chars is almost certainly a dragged path from a
+            // terminal that doesn't wrap drops in bracketed-paste escapes.
+            // Accumulate; tick() flushes after a short idle gap.
+            KeyCode::Char(c)
+                if self.focus == Focus::DropZone
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                let now = std::time::Instant::now();
+                let continuation = matches!(self.paste_buffer_last_char,
+                    Some(prev) if now.duration_since(prev) < std::time::Duration::from_millis(60));
+                if !continuation {
+                    self.paste_buffer.clear();
+                }
+                self.paste_buffer.push(c);
+                self.paste_buffer_last_char = Some(now);
             }
             _ => {}
         }
