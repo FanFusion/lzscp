@@ -112,6 +112,7 @@ async fn run_app(
     cfg: config::Config,
 ) -> Result<()> {
     let mut app = App::new(cfg);
+    app.spawn_rsync_version_check();
     app.spawn_preflight_all();
     let mut events = EventStream::new();
     let mut tick = interval(Duration::from_millis(100));

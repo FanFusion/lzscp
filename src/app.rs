@@ -26,6 +26,7 @@ pub enum AppEvent {
         target_name: String,
         result: std::result::Result<(), String>,
     },
+    RsyncVersionWarning(String),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -66,6 +67,7 @@ pub enum MenuAction {
     RemoveCurrentTarget,
     ReprobeTargets,
     InstallRsyncOnSelected,
+    ClearProgressHistory,
     ToggleMode,
     CycleClipboardFormat,
     CycleTheme,
@@ -82,6 +84,7 @@ impl MenuAction {
             MenuAction::RemoveCurrentTarget => "Remove selected target",
             MenuAction::ReprobeTargets => "Re-probe all targets",
             MenuAction::InstallRsyncOnSelected => "Install rsync on selected target",
+            MenuAction::ClearProgressHistory => "Clear transfer history",
             MenuAction::ToggleMode => "Toggle auto / manual mode",
             MenuAction::CycleClipboardFormat => "Cycle clipboard format",
             MenuAction::CycleTheme => "Cycle theme",
@@ -98,6 +101,7 @@ impl MenuAction {
             MenuAction::RemoveCurrentTarget => "-",
             MenuAction::ReprobeTargets => "r",
             MenuAction::InstallRsyncOnSelected => "i",
+            MenuAction::ClearProgressHistory => "X",
             MenuAction::ToggleMode => "a/m",
             MenuAction::CycleClipboardFormat => "c",
             MenuAction::CycleTheme => "t",
@@ -114,6 +118,7 @@ impl MenuAction {
             MenuAction::RemoveCurrentTarget,
             MenuAction::ReprobeTargets,
             MenuAction::InstallRsyncOnSelected,
+            MenuAction::ClearProgressHistory,
             MenuAction::ToggleMode,
             MenuAction::CycleClipboardFormat,
             MenuAction::CycleTheme,
@@ -139,6 +144,8 @@ pub struct HitRegions {
     pub targets_panel: Rect,
     pub target_rows: Vec<Rect>,
     pub progress_panel: Rect,
+    /// Clickable completed transfers — (area, transfer_id)
+    pub progress_rows: Vec<(Rect, u64)>,
     pub help_bar_hits: Vec<(Rect, HelpBarAction)>,
     pub modal_area: Option<Rect>,
     pub modal_hits: Vec<(Rect, ModalHit)>,
@@ -307,7 +314,27 @@ impl App {
                 target_name,
                 result,
             } => self.apply_remote_install_result(&target_name, result),
+            AppEvent::RsyncVersionWarning(msg) => self.toast(&msg),
         }
+    }
+
+    /// Probe the local rsync version once at startup so we can warn the user
+    /// if it's ancient — macOS ships rsync 2.6.9 which lacks many useful
+    /// flags and tends to bite people exactly in this workflow.
+    pub fn spawn_rsync_version_check(&mut self) {
+        let tx = self.app_tx.clone();
+        tokio::spawn(async move {
+            let (a, b, _c) = crate::transfer::local_rsync_version().await;
+            if a == 0 {
+                let _ = tx.send(AppEvent::RsyncVersionWarning(
+                    "rsync not found locally — install it: brew install rsync".to_string(),
+                ));
+            } else if (a, b) < (3, 0) {
+                let _ = tx.send(AppEvent::RsyncVersionWarning(format!(
+                    "local rsync is v{a}.{b} (old); upgrade: brew install rsync"
+                )));
+            }
+        });
     }
 
     pub fn spawn_preflight_all(&mut self) {
@@ -527,6 +554,17 @@ impl App {
             }
         }
 
+        // Progress row click → if that transfer completed, re-copy its remote
+        // path to the clipboard (useful when multiple parallel transfers
+        // finish in quick succession).
+        for (r, id) in self.hit_regions.progress_rows.clone() {
+            if rect_contains(r, x, y) {
+                self.focus = Focus::Progress;
+                self.recopy_completed(id);
+                return;
+            }
+        }
+
         // Panel background click → focus that panel.
         if rect_contains(self.hit_regions.drop_zone, x, y) {
             self.focus = Focus::DropZone;
@@ -719,6 +757,12 @@ impl App {
                         self.toast("select a single target first");
                     }
                 }
+            }
+            MenuAction::ClearProgressHistory => {
+                let n = self.transfers.len();
+                self.transfers.clear();
+                self.transfer_index.clear();
+                self.toast(&format!("cleared {n} transfer(s)"));
             }
             MenuAction::ToggleMode => {
                 self.mode = match self.mode {
@@ -1147,6 +1191,23 @@ impl App {
     fn transfer_mut(&mut self, id: u64) -> Option<&mut Transfer> {
         let idx = *self.transfer_index.get(&id)?;
         self.transfers.get_mut(idx)
+    }
+
+    fn recopy_completed(&mut self, id: u64) {
+        let Some(idx) = self.transfer_index.get(&id).copied() else {
+            return;
+        };
+        let Some(t) = self.transfers.get(idx) else {
+            return;
+        };
+        if t.state != TransferState::Completed {
+            self.toast("transfer not completed yet");
+            return;
+        }
+        let local = t.local.clone();
+        let target_name = t.target_name.clone();
+        let remote = t.remote_abs_dir.clone();
+        self.update_clipboard_for_completed(&target_name, &local, &remote);
     }
 
     fn update_clipboard_for_completed(

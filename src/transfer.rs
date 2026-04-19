@@ -114,7 +114,10 @@ async fn run(
     ssh_opt.push_str(" -o BatchMode=no -o StrictHostKeyChecking=accept-new");
 
     let mut cmd = Command::new("rsync");
-    cmd.arg("--info=progress2")
+    // --progress works from rsync 2.6+ (macOS default 2.6.9) and emits
+    // per-file progress lines. Newer versions also accept it.
+    // --partial lets failed transfers resume from where they stopped.
+    cmd.arg("--progress")
         .arg("--partial")
         .arg("-e")
         .arg(&ssh_opt)
@@ -127,14 +130,25 @@ async fn run(
     let stdout = child.stdout.take().context("rsync stdout pipe")?;
     let stderr = child.stderr.take().context("rsync stderr pipe")?;
 
+    use std::sync::{Arc, Mutex};
+    let stderr_buf: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+
     let tx_out = tx.clone();
-    let tx_err = tx.clone();
     let stdout_task = tokio::spawn(async move {
         read_progress_stream(id, stdout, tx_out).await;
     });
+    let tx_err = tx.clone();
+    let stderr_sink = stderr_buf.clone();
     let stderr_task = tokio::spawn(async move {
         let mut reader = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = reader.next_line().await {
+            {
+                let mut s = stderr_sink.lock().expect("stderr lock");
+                if !s.is_empty() {
+                    s.push('\n');
+                }
+                s.push_str(&line);
+            }
             let _ = tx_err.send(TransferEvent::Line { id, line });
         }
     });
@@ -148,11 +162,70 @@ async fn run(
         Ok(())
     } else {
         let code = status.code().unwrap_or(-1);
+        let captured = stderr_buf.lock().expect("stderr lock").clone();
+        let detail = if captured.is_empty() {
+            explain_rsync_exit(code).to_string()
+        } else {
+            captured
+                .lines()
+                .rfind(|l| !l.trim().is_empty())
+                .unwrap_or(&captured)
+                .to_string()
+        };
         let _ = tx.send(TransferEvent::Failed {
             id,
-            error: format!("rsync exited with status {code}"),
+            error: format!("rsync exit {code}: {detail}"),
         });
         Ok(())
+    }
+}
+
+fn explain_rsync_exit(code: i32) -> &'static str {
+    match code {
+        1 => "syntax or usage error (wrong rsync option?)",
+        2 => "protocol incompatibility",
+        3 => "file selection error",
+        5 => "error starting client-server protocol",
+        10 => "socket / network error",
+        11 => "file I/O error",
+        12 => "data stream error",
+        13 => "diagnostic-only error",
+        14 => "ipc code error",
+        20 => "received SIGUSR1 or SIGINT",
+        23 => "partial transfer (some files could not be copied)",
+        24 => "source files vanished before transfer",
+        30 => "timeout in data send/receive",
+        35 => "timeout waiting for connection",
+        127 => "rsync not found on remote or local",
+        _ => "see above",
+    }
+}
+
+/// Returns the local rsync version (X, Y, Z) by running `rsync --version`.
+/// Returns (0, 0, 0) if detection fails. Used at startup to warn about
+/// macOS's ancient 2.6.9 which lacks --info=progress2 and many other flags.
+pub async fn local_rsync_version() -> (u32, u32, u32) {
+    let out = match Command::new("rsync").arg("--version").output().await {
+        Ok(o) => o,
+        Err(_) => return (0, 0, 0),
+    };
+    if !out.status.success() {
+        return (0, 0, 0);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // First line: "rsync  version 3.2.7  protocol version 31" (or 2.x etc.)
+    let first = text.lines().next().unwrap_or("");
+    let re = Regex::new(r"version\s+(\d+)\.(\d+)(?:\.(\d+))?").expect("rsync ver re");
+    if let Some(caps) = re.captures(first) {
+        let a = caps[1].parse::<u32>().unwrap_or(0);
+        let b = caps[2].parse::<u32>().unwrap_or(0);
+        let c = caps
+            .get(3)
+            .and_then(|m| m.as_str().parse::<u32>().ok())
+            .unwrap_or(0);
+        (a, b, c)
+    } else {
+        (0, 0, 0)
     }
 }
 

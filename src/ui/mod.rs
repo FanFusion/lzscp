@@ -94,6 +94,7 @@ fn draw_ssh_picker(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Pale
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(""));
     let max_rows = h.saturating_sub(3) as usize;
+    let inner_w = w.saturating_sub(2) as usize;
     for (i, host) in picker.list.iter().enumerate().take(max_rows) {
         let selected = i == picker.cursor;
         let row_y = rect.y + 1 + (i as u16) + 1;
@@ -103,22 +104,25 @@ fn draw_ssh_picker(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Pale
             if host.user.is_some() { "@" } else { "" },
             host.hostname.clone().unwrap_or_else(|| host.name.clone()),
         );
-        let label = Span::styled(
-            format!("  {}. {}", i + 1, host.name),
-            if selected {
-                Style::default()
-                    .fg(p.bg)
-                    .bg(p.accent)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(p.fg)
-            },
-        );
-        let endpoint_span = Span::styled(
-            format!("  {endpoint}"),
-            Style::default().fg(if selected { p.bg } else { p.muted }),
-        );
-        lines.push(Line::from(vec![label, endpoint_span]));
+        // Render the row as a single pre-padded string so we can apply one
+        // consistent highlight style across the whole line — otherwise a
+        // partial-width highlight (label only) hides the endpoint when the
+        // unstyled background matches the selected fg.
+        let raw = format!("  {}. {}  {}", i + 1, host.name, endpoint);
+        let padded = if raw.chars().count() < inner_w {
+            format!("{}{}", raw, " ".repeat(inner_w - raw.chars().count()))
+        } else {
+            raw
+        };
+        let style = if selected {
+            Style::default()
+                .fg(p.bg)
+                .bg(p.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.fg)
+        };
+        lines.push(Line::from(Span::styled(padded, style)));
         app.hit_regions
             .ssh_picker_rows
             .push(Rect::new(rect.x + 1, row_y, w.saturating_sub(2), 1));
@@ -686,6 +690,11 @@ fn draw_progress(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palett
         }
         let caption_area = Rect::new(slot.x, slot.y, slot.width, 1);
         let bar_area = Rect::new(slot.x, slot.y + 1, slot.width, 1);
+        // Register the full row (caption + bar) as a click target mapped to
+        // this transfer's id. Clicking a completed row re-copies its path.
+        app.hit_regions
+            .progress_rows
+            .push((Rect::new(slot.x, slot.y, slot.width, 2), t.id));
 
         let color = match t.state {
             TransferState::Completed => p.diff_add,
@@ -724,6 +733,23 @@ fn draw_progress(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palett
         };
         let pct_text = format!(" {percent:>3}%");
 
+        let trailing = match t.state {
+            TransferState::Completed => Span::styled(
+                "  📋 click to copy".to_string(),
+                Style::default().fg(p.muted),
+            ),
+            TransferState::Failed => Span::styled(
+                format!(
+                    "  {}",
+                    t.last_error
+                        .as_deref()
+                        .map(|e| truncate_middle(e, 48))
+                        .unwrap_or_default()
+                ),
+                Style::default().fg(p.diff_del),
+            ),
+            _ => Span::raw(""),
+        };
         let caption = Line::from(vec![
             Span::raw(" "),
             Span::styled(icon, icon_style),
@@ -737,6 +763,7 @@ fn draw_progress(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palett
             Span::raw("  "),
             Span::styled(pct_text, Style::default().fg(color)),
             Span::styled(rate_text, Style::default().fg(p.muted)),
+            trailing,
         ]);
         f.render_widget(
             Paragraph::new(caption).style(Style::default().bg(p.bg)),
