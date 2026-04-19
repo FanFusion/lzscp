@@ -272,6 +272,7 @@ pub struct WatchForm {
     pub patterns: String,
     pub targets: Vec<String>, // selected target/group names
     pub catchup: CatchupMode,
+    pub recursive: bool,
     /// Cursor into `all_target_options` when `field == Targets`.
     pub target_cursor: usize,
     pub all_target_options: Vec<String>,
@@ -291,6 +292,7 @@ pub enum WatchFormField {
     Patterns,
     Targets,
     Catchup,
+    Recursive,
 }
 
 impl WatchFormField {
@@ -300,16 +302,18 @@ impl WatchFormField {
             Self::Path => Self::Patterns,
             Self::Patterns => Self::Targets,
             Self::Targets => Self::Catchup,
-            Self::Catchup => Self::Name,
+            Self::Catchup => Self::Recursive,
+            Self::Recursive => Self::Name,
         }
     }
     fn prev(self) -> Self {
         match self {
-            Self::Name => Self::Catchup,
+            Self::Name => Self::Recursive,
             Self::Path => Self::Name,
             Self::Patterns => Self::Path,
             Self::Targets => Self::Patterns,
             Self::Catchup => Self::Targets,
+            Self::Recursive => Self::Catchup,
         }
     }
 }
@@ -1589,7 +1593,7 @@ impl App {
                 let tr = Transfer::new(id, t, file.clone());
                 self.transfer_index.insert(id, self.transfers.len());
                 self.transfers.push(tr);
-                transfer::spawn(id, t.clone(), file.clone(), self.transfer_tx.clone());
+                transfer::spawn(id, t.clone(), file.clone(), None, self.transfer_tx.clone());
             }
         }
         if skipped.is_empty() {
@@ -1985,6 +1989,7 @@ impl App {
             patterns: String::from("*.png *.jpg *.jpeg *.heic *.webp"),
             targets: Vec::new(),
             catchup: CatchupMode::Prompt,
+            recursive: false,
             target_cursor: 0,
             all_target_options: self.all_target_options(),
             error: None,
@@ -2005,6 +2010,7 @@ impl App {
             patterns: ui.config.patterns.join(" "),
             targets: ui.config.targets.clone(),
             catchup: ui.config.catchup,
+            recursive: ui.config.recursive,
             target_cursor: 0,
             all_target_options: self.all_target_options(),
             error: None,
@@ -2083,6 +2089,18 @@ impl App {
                     };
                 }
             }
+            WatchFormField::Recursive => {
+                if matches!(
+                    key.code,
+                    KeyCode::Char(' ')
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::Char('h')
+                        | KeyCode::Char('l')
+                ) {
+                    form.recursive = !form.recursive;
+                }
+            }
         }
     }
 
@@ -2146,7 +2164,7 @@ impl App {
             catchup: form.catchup,
             enabled: false,
             debounce_ms: 500,
-            recursive: false,
+            recursive: form.recursive,
         };
 
         match form.mode {
@@ -2253,7 +2271,13 @@ impl App {
                 Transfer::new_from_watch(id, target, path.clone(), watch_name.to_string());
             self.transfer_index.insert(id, self.transfers.len());
             self.transfers.push(transfer);
-            transfer::spawn(id, target.clone(), path.clone(), self.transfer_tx.clone());
+            transfer::spawn(
+                id,
+                target.clone(),
+                path.clone(),
+                Some(watch_name.to_string()),
+                self.transfer_tx.clone(),
+            );
         }
     }
 }

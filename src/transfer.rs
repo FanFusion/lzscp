@@ -84,9 +84,17 @@ impl Transfer {
 }
 
 /// Spawn rsync for `local` → `target`. Events are emitted via `tx`.
-pub fn spawn(id: u64, target: Target, local: PathBuf, tx: mpsc::UnboundedSender<TransferEvent>) {
+/// `subdir` optionally appends a subdirectory under `target.remote_dir` so each
+/// watch can land in its own folder (e.g. `~/lzsync-inbox/shots/`).
+pub fn spawn(
+    id: u64,
+    target: Target,
+    local: PathBuf,
+    subdir: Option<String>,
+    tx: mpsc::UnboundedSender<TransferEvent>,
+) {
     tokio::spawn(async move {
-        if let Err(e) = run(id, &target, &local, &tx).await {
+        if let Err(e) = run(id, &target, &local, subdir.as_deref(), &tx).await {
             let _ = tx.send(TransferEvent::Failed {
                 id,
                 error: format!("{e:#}"),
@@ -99,6 +107,7 @@ async fn run(
     id: u64,
     target: &Target,
     local: &Path,
+    subdir: Option<&str>,
     tx: &mpsc::UnboundedSender<TransferEvent>,
 ) -> Result<()> {
     let _ = tx.send(TransferEvent::Started {
@@ -107,7 +116,7 @@ async fn run(
         local: local.to_path_buf(),
     });
 
-    let remote_abs_dir = resolve_remote_home(target)
+    let remote_abs_dir = resolve_remote_home(target, subdir)
         .await
         .with_context(|| format!("resolving remote dir for target '{}'", target.name))?;
 
@@ -327,8 +336,9 @@ pub fn parse_progress_line(line: &str) -> Option<Progress> {
 }
 
 /// Expand remote_dir's `~` / `$HOME` *and* create the directory on the remote.
-/// Returns the absolute remote path.
-async fn resolve_remote_home(target: &Target) -> Result<String> {
+/// Returns the absolute remote path. If `subdir` is Some, it's appended to
+/// `remote_dir` and created as well (used for per-watch isolation).
+async fn resolve_remote_home(target: &Target, subdir: Option<&str>) -> Result<String> {
     // Single round-trip: let the remote shell expand $HOME, mkdir -p, print the
     // resolved absolute path. This both fixes "~/foo doesn't exist" and removes
     // a second ssh call on the hot path.
@@ -346,11 +356,18 @@ async fn resolve_remote_home(target: &Target) -> Result<String> {
     };
     cmd.arg(addr);
     // Use single quotes locally and escape the remote_dir value — the remote
-    // shell expands ~ / $HOME.
-    let script = format!(
-        r#"d={remote}; d="${{d/#~/$HOME}}"; mkdir -p "$d" && cd "$d" && pwd"#,
-        remote = shell_single_quote(&target.remote_dir)
-    );
+    // shell expands ~ / $HOME. If a subdir is provided, append and mkdir it too.
+    let script = match subdir {
+        Some(sub) => format!(
+            r#"d={remote}; d="${{d/#~/$HOME}}"; t="$d"/{sub}; mkdir -p "$t" && cd "$t" && pwd"#,
+            remote = shell_single_quote(&target.remote_dir),
+            sub = shell_single_quote(sub),
+        ),
+        None => format!(
+            r#"d={remote}; d="${{d/#~/$HOME}}"; mkdir -p "$d" && cd "$d" && pwd"#,
+            remote = shell_single_quote(&target.remote_dir)
+        ),
+    };
     cmd.arg(script);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let output = cmd.output().await.context("ssh mkdir -p")?;

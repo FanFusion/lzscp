@@ -72,7 +72,7 @@ fn draw_watch_form(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette)
     };
     let w = 66.min(area.width.saturating_sub(4));
     let opts_h = form.all_target_options.len().clamp(1, 6) as u16;
-    let h = (14 + opts_h).min(area.height.saturating_sub(2));
+    let h = (15 + opts_h).min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect::new(x, y, w, h);
@@ -157,6 +157,30 @@ fn draw_watch_form(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette)
         Span::styled(
             format!("⟨ {catchup_label} ⟩"),
             if c_focus {
+                Style::default().fg(p.accent)
+            } else {
+                Style::default().fg(p.fg)
+            },
+        ),
+    ]));
+
+    let r_focus = form.field == WatchFormField::Recursive;
+    let r_label_style = if r_focus {
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.muted)
+    };
+    let r_value = if form.recursive {
+        "[✓] recurse into subfolders"
+    } else {
+        "[ ] top level only"
+    };
+    lines.push(Line::from(vec![
+        Span::styled(" Recursive", r_label_style),
+        Span::raw(" "),
+        Span::styled(
+            r_value,
+            if r_focus {
                 Style::default().fg(p.accent)
             } else {
                 Style::default().fg(p.fg)
@@ -273,7 +297,8 @@ fn draw_watches(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(border_style(focused, p));
+        .border_style(border_style(focused, p))
+        .style(Style::default().bg(p.bg).fg(p.fg));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -381,7 +406,8 @@ fn draw_watch_recent(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palett
     let block = Block::default()
         .title(" recent ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(p.muted));
+        .border_style(Style::default().fg(p.muted))
+        .style(Style::default().bg(p.bg).fg(p.fg));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
