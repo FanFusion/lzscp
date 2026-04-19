@@ -1133,11 +1133,14 @@ fn draw_activity(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palett
 
     // Live = anything not yet recorded in history (record_history only runs
     // on Completed, so Completed rows migrate to history automatically).
+    // Watch-sourced transfers are rendered on the Watch tab's Recent panel
+    // — excluded here to keep Drop's Activity focused on manual drops.
     let live: Vec<Transfer> = app
         .transfers
         .iter()
         .rev()
         .filter(|t| t.state != TransferState::Completed)
+        .filter(|t| t.source_watch.is_none())
         .filter(|t| {
             if query.is_empty() {
                 return true;
@@ -1154,10 +1157,13 @@ fn draw_activity(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palett
 
     // History: filter, then group by remote_path (same file on 2 hosts = 1
     // row with both target names joined). Preserve newest-first order.
+    // Same rule as live: watch-sourced entries are shown only on the Watch
+    // tab's Recent panel, not duplicated here.
     let raw: Vec<HistoryEntry> = app
         .history
         .filter(&app.activity_query())
         .into_iter()
+        .filter(|e| e.source_watch.is_none())
         .cloned()
         .collect();
     let groups: Vec<HistoryGroup> = group_history(&raw);

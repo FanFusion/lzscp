@@ -899,6 +899,31 @@ impl App {
             self.should_quit = true;
             return;
         }
+        // Burst-mode guard against dragged paths turning into commands.
+        // A path dragged from Finder always begins with `/` and arrives as
+        // a tight char stream. If we see a `/` or we're already accumulating
+        // a burst (<60ms between chars), swallow the char regardless of focus
+        // so the bare-letter keys (`d` / `y` / `a` / ...) can't fire mid-path.
+        // `flush_paste_buffer_if_idle` flushes after ~120ms and routes to
+        // `handle_paste`, which is tab/focus-scoped (Drop-tab DropZone only).
+        if let KeyCode::Char(c) = key.code
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            let now = std::time::Instant::now();
+            let in_burst = matches!(self.paste_buffer_last_char,
+                Some(prev) if now.duration_since(prev) < std::time::Duration::from_millis(60));
+            let start_burst = self.paste_buffer.is_empty() && c == '/';
+            if in_burst || start_burst {
+                if !in_burst {
+                    self.paste_buffer.clear();
+                }
+                self.paste_buffer.push(c);
+                self.paste_buffer_last_char = Some(now);
+                return;
+            }
+        }
         // Update confirm modal swallows keys: y confirms, n/Esc dismisses.
         if let UpdateStatus::Available(ref v) = self.update_status {
             match key.code {
@@ -1251,9 +1276,15 @@ impl App {
         let q = self.activity_query();
         let q_lower = q.to_lowercase();
         let mut out = Vec::new();
-        // Live = anything not yet in history.
+        // Live = anything not yet in history. Watch-sourced transfers are
+        // excluded here because they have their own panel on the Watch tab
+        // — double-listing them made fan-out to multiple targets look like
+        // quadruple-sync.
         for t in self.transfers.iter().rev() {
             if t.state == TransferState::Completed {
+                continue;
+            }
+            if t.source_watch.is_some() {
                 continue;
             }
             if !q_lower.is_empty() {
@@ -1272,9 +1303,14 @@ impl App {
         }
         // History — merged by remote_path. The rep is the FIRST (newest)
         // entry seen for a given remote_path in the filtered list.
+        // Watch-sourced history entries are also excluded to match the
+        // live-transfer filter above.
         let matches = self.history.filter(&q);
         let mut seen: std::collections::HashMap<String, ()> = std::collections::HashMap::new();
         for (i, e) in matches.iter().enumerate() {
+            if e.source_watch.is_some() {
+                continue;
+            }
             if seen.contains_key(&e.remote_path) {
                 continue;
             }
@@ -2499,6 +2535,14 @@ impl App {
         subdir: Option<String>,
         source_watch: Option<String>,
     ) {
+        // Guard against the macOS screenshot rename race: screenshots land as
+        // "name.png" (with a space) and are atomically renamed to the
+        // underscore variant a moment later. Without this check the poller's
+        // pre-rename path makes it to rsync after the file has vanished,
+        // causing a bogus "exit 23" failure in Recent.
+        if !local.exists() {
+            return;
+        }
         if !self.cfg.confirm_remote_overwrite {
             // User opted out of preflight — go straight to rsync. rsync will
             // silently overwrite if remote exists; pre-0.4.5 behavior.
@@ -2605,6 +2649,12 @@ impl App {
         source_watch: Option<String>,
         rename_to: Option<String>,
     ) {
+        // Second-line vanished check — the file could have been renamed
+        // between preflight_and_start and us getting here (collision SSH
+        // round-trip adds ~100ms).
+        if !local.exists() {
+            return;
+        }
         let id = self.next_transfer_id;
         self.next_transfer_id += 1;
         let transfer = if let Some(w) = source_watch.as_ref() {
