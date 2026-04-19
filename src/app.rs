@@ -181,6 +181,25 @@ fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
     x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
+/// Append / backspace into a String based on a key event. Scoped to the
+/// Watch form where editing is strictly linear (no mid-string cursor).
+fn handle_text_key(buf: &mut String, key: KeyEvent) {
+    // Skip anything with Ctrl so the global shortcuts don't get eaten by
+    // the form's text fields.
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return;
+    }
+    match key.code {
+        KeyCode::Backspace => {
+            buf.pop();
+        }
+        KeyCode::Char(c) => {
+            buf.push(c);
+        }
+        _ => {}
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetKind {
     Single,
@@ -241,6 +260,59 @@ pub enum WatchUiStatus {
     Error(String),
 }
 
+/// Modal edit form for creating or editing a `[[watch]]` block. Driven by
+/// `a` (new) / `e` (edit current) from the Watch tab.
+#[derive(Debug, Clone)]
+pub struct WatchForm {
+    pub mode: WatchFormMode,
+    pub field: WatchFormField,
+    pub name: String,
+    pub path: String,
+    pub patterns: String,
+    pub targets: Vec<String>, // selected target/group names
+    pub catchup: CatchupMode,
+    /// Cursor into `all_target_options` when `field == Targets`.
+    pub target_cursor: usize,
+    pub all_target_options: Vec<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchFormMode {
+    New,
+    Edit(usize), // index into App::watches
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchFormField {
+    Name,
+    Path,
+    Patterns,
+    Targets,
+    Catchup,
+}
+
+impl WatchFormField {
+    fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Path,
+            Self::Path => Self::Patterns,
+            Self::Patterns => Self::Targets,
+            Self::Targets => Self::Catchup,
+            Self::Catchup => Self::Name,
+        }
+    }
+    fn prev(self) -> Self {
+        match self {
+            Self::Name => Self::Catchup,
+            Self::Path => Self::Name,
+            Self::Patterns => Self::Path,
+            Self::Targets => Self::Patterns,
+            Self::Catchup => Self::Targets,
+        }
+    }
+}
+
 /// Event emitted by a running poller and recorded for display in the Watch
 /// tab's Recent panel. Kept separate from `history` so watch-specific info
 /// (which watch produced the event) is preserved.
@@ -283,6 +355,13 @@ pub struct App {
     pub watch_tx: mpsc::UnboundedSender<WatchEvent>,
     pub watch_rx: mpsc::UnboundedReceiver<WatchEvent>,
     pub watch_state: PersistedState,
+    /// Some(form) when the user is actively editing a watch. When present
+    /// the Watch tab's normal key bindings are suppressed in favor of form
+    /// input.
+    pub watch_form: Option<WatchForm>,
+    /// Some(index) when the user pressed `d` to delete a watch and we're
+    /// waiting on `y` to confirm.
+    pub watch_delete_confirm: Option<usize>,
 
     pub queue: Vec<PathBuf>,
     pub queue_cursor: usize,
@@ -387,6 +466,8 @@ impl App {
             watch_tx,
             watch_rx,
             watch_state,
+            watch_form: None,
+            watch_delete_confirm: None,
             queue: vec![],
             queue_cursor: 0,
             last_paste_error: None,
@@ -825,6 +906,11 @@ impl App {
             self.help_visible = false;
             return;
         }
+        // The Watch form is modal: all keys go to it until saved/cancelled.
+        if self.watch_form.is_some() {
+            self.handle_watch_form_key(key);
+            return;
+        }
         // Activity filter input swallows text while active.
         if self.activity_filter.is_some() && self.focus == Focus::Progress {
             match key.code {
@@ -897,11 +983,20 @@ impl App {
                 _ => {}
             },
             // Watch tab: Space toggles the current folder, j/k move cursor,
-            // r flushes the current watch's pending catchup batch.
+            // r flushes catchup, a/e/d manage watches in-TUI.
             KeyCode::Char(' ') if self.focus == Focus::Watches => self.toggle_current_watch(),
             KeyCode::Char('j') if self.focus == Focus::Watches => self.move_watch_cursor(1),
             KeyCode::Char('k') if self.focus == Focus::Watches => self.move_watch_cursor(-1),
             KeyCode::Char('r') if self.focus == Focus::Watches => self.flush_current_catchup(),
+            KeyCode::Char('a') if self.focus == Focus::Watches => self.open_new_watch_form(),
+            KeyCode::Char('e') if self.focus == Focus::Watches => self.open_edit_watch_form(),
+            KeyCode::Char('d') if self.focus == Focus::Watches => self.arm_delete_current_watch(),
+            KeyCode::Char('y') if self.watch_delete_confirm.is_some() => {
+                self.confirm_delete_current_watch();
+            }
+            KeyCode::Char('n') | KeyCode::Esc if self.watch_delete_confirm.is_some() => {
+                self.watch_delete_confirm = None;
+            }
             // Space / 1–9 still act as Targets-panel conveniences — they
             // fire ONLY when Targets is focused, so a path dropped into the
             // DropZone can't toggle anything.
@@ -1854,6 +1949,252 @@ impl App {
             // mode with watches.
             self.queue.push(path);
         }
+    }
+
+    // =====================
+    // Watch form (add/edit/delete)
+    // =====================
+
+    fn all_target_options(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.cfg.targets.iter().map(|t| t.name.clone()).collect();
+        for g in &self.cfg.groups {
+            out.push(g.name.clone());
+        }
+        out
+    }
+
+    pub fn open_new_watch_form(&mut self) {
+        if self.cfg.targets.is_empty() && self.cfg.groups.is_empty() {
+            self.toast("add a target first (Ctrl+P → Add target from ~/.ssh/config)");
+            return;
+        }
+        self.watch_form = Some(WatchForm {
+            mode: WatchFormMode::New,
+            field: WatchFormField::Name,
+            name: String::new(),
+            path: String::from("~/Desktop"),
+            patterns: String::from("*.png *.jpg *.jpeg *.heic *.webp"),
+            targets: Vec::new(),
+            catchup: CatchupMode::Prompt,
+            target_cursor: 0,
+            all_target_options: self.all_target_options(),
+            error: None,
+        });
+    }
+
+    pub fn open_edit_watch_form(&mut self) {
+        let Some(ui) = self.watches.get(self.watch_cursor) else {
+            self.toast("no watch to edit");
+            return;
+        };
+        let idx = self.watch_cursor;
+        self.watch_form = Some(WatchForm {
+            mode: WatchFormMode::Edit(idx),
+            field: WatchFormField::Name,
+            name: ui.name.clone(),
+            path: ui.config.path.clone(),
+            patterns: ui.config.patterns.join(" "),
+            targets: ui.config.targets.clone(),
+            catchup: ui.config.catchup,
+            target_cursor: 0,
+            all_target_options: self.all_target_options(),
+            error: None,
+        });
+    }
+
+    fn handle_watch_form_key(&mut self, key: KeyEvent) {
+        let Some(form) = self.watch_form.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.watch_form = None;
+                return;
+            }
+            KeyCode::Tab => {
+                form.field = form.field.next();
+                return;
+            }
+            KeyCode::BackTab => {
+                form.field = form.field.prev();
+                return;
+            }
+            KeyCode::Enter => {
+                self.save_watch_form();
+                return;
+            }
+            _ => {}
+        }
+        match form.field {
+            WatchFormField::Name => handle_text_key(&mut form.name, key),
+            WatchFormField::Path => handle_text_key(&mut form.path, key),
+            WatchFormField::Patterns => handle_text_key(&mut form.patterns, key),
+            WatchFormField::Targets => {
+                let opts_len = form.all_target_options.len();
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if opts_len > 0 {
+                            form.target_cursor = (form.target_cursor + opts_len - 1) % opts_len;
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if opts_len > 0 {
+                            form.target_cursor = (form.target_cursor + 1) % opts_len;
+                        }
+                    }
+                    KeyCode::Char(' ') => {
+                        if let Some(name) = form.all_target_options.get(form.target_cursor).cloned()
+                        {
+                            if let Some(pos) = form.targets.iter().position(|n| n == &name) {
+                                form.targets.remove(pos);
+                            } else {
+                                form.targets.push(name);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            WatchFormField::Catchup => {
+                if matches!(
+                    key.code,
+                    KeyCode::Char(' ') | KeyCode::Right | KeyCode::Char('l')
+                ) {
+                    form.catchup = match form.catchup {
+                        CatchupMode::Prompt => CatchupMode::Auto,
+                        CatchupMode::Auto => CatchupMode::Ignore,
+                        CatchupMode::Ignore => CatchupMode::Prompt,
+                    };
+                }
+                if matches!(key.code, KeyCode::Left | KeyCode::Char('h')) {
+                    form.catchup = match form.catchup {
+                        CatchupMode::Prompt => CatchupMode::Ignore,
+                        CatchupMode::Auto => CatchupMode::Prompt,
+                        CatchupMode::Ignore => CatchupMode::Auto,
+                    };
+                }
+            }
+        }
+    }
+
+    fn save_watch_form(&mut self) {
+        let Some(form) = self.watch_form.clone() else {
+            return;
+        };
+        let name = form.name.trim().to_string();
+        let path = form.path.trim().to_string();
+        if name.is_empty() {
+            if let Some(f) = self.watch_form.as_mut() {
+                f.error = Some("name is required".into());
+            }
+            return;
+        }
+        if path.is_empty() {
+            if let Some(f) = self.watch_form.as_mut() {
+                f.error = Some("path is required".into());
+            }
+            return;
+        }
+        if form.targets.is_empty() {
+            if let Some(f) = self.watch_form.as_mut() {
+                f.error =
+                    Some("select at least one target (Tab to Targets, Space to toggle)".into());
+            }
+            return;
+        }
+        // Duplicate-name check, scoped to other entries if editing.
+        let duplicate =
+            self.cfg.watches.iter().enumerate().any(|(i, w)| {
+                w.name == name && !matches!(form.mode, WatchFormMode::Edit(e) if e == i)
+            });
+        if duplicate {
+            if let Some(f) = self.watch_form.as_mut() {
+                f.error = Some(format!("a watch named '{name}' already exists"));
+            }
+            return;
+        }
+        let patterns: Vec<String> = form
+            .patterns
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
+
+        let new_cfg = WatchConfig {
+            name: name.clone(),
+            path,
+            targets: form.targets.clone(),
+            patterns: if patterns.is_empty() {
+                vec![
+                    "*.png".into(),
+                    "*.jpg".into(),
+                    "*.jpeg".into(),
+                    "*.heic".into(),
+                    "*.webp".into(),
+                ]
+            } else {
+                patterns
+            },
+            catchup: form.catchup,
+            enabled: false,
+            debounce_ms: 500,
+            recursive: false,
+        };
+
+        match form.mode {
+            WatchFormMode::New => {
+                self.cfg.watches.push(new_cfg.clone());
+                self.watches.push(WatchUi::from_config(&new_cfg));
+                self.watch_cursor = self.watches.len().saturating_sub(1);
+            }
+            WatchFormMode::Edit(idx) => {
+                // Stop the running poller if the user is editing its
+                // configuration — the new config will only take effect on
+                // the next Space press.
+                let running = self.watch_handles.contains_key(&self.watches[idx].name);
+                if running {
+                    let old_name = self.watches[idx].name.clone();
+                    self.stop_watch(&old_name);
+                }
+                // Replace the cfg entry. Config list is source of truth; UI
+                // list is rebuilt from it.
+                self.cfg.watches[idx] = new_cfg.clone();
+                self.watches[idx] = WatchUi::from_config(&new_cfg);
+                self.watch_cursor = idx;
+            }
+        }
+        self.watch_form = None;
+        self.persist_config();
+    }
+
+    pub fn arm_delete_current_watch(&mut self) {
+        if self.watches.get(self.watch_cursor).is_none() {
+            return;
+        }
+        self.watch_delete_confirm = Some(self.watch_cursor);
+        let name = &self.watches[self.watch_cursor].name;
+        self.toast(&format!(
+            "delete '{name}'? press y to confirm, n / Esc to cancel"
+        ));
+    }
+
+    pub fn confirm_delete_current_watch(&mut self) {
+        let Some(idx) = self.watch_delete_confirm.take() else {
+            return;
+        };
+        if idx >= self.watches.len() {
+            return;
+        }
+        let name = self.watches[idx].name.clone();
+        if self.watch_handles.contains_key(&name) {
+            self.stop_watch(&name);
+        }
+        self.cfg.watches.retain(|w| w.name != name);
+        self.watches.remove(idx);
+        if self.watch_cursor >= self.watches.len() && self.watch_cursor > 0 {
+            self.watch_cursor -= 1;
+        }
+        self.persist_config();
+        self.toast(&format!("deleted watch '{name}'"));
     }
 
     /// Flush the current watch row's pending catchup: synthesize NewFile

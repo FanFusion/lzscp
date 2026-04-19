@@ -8,9 +8,10 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{
     ActivityRef, App, Focus, HelpBarAction, HitRegions, ModalHit, Tab, TargetKind, TargetStatus,
-    UpdateStatus, WatchUi, WatchUiStatus,
+    UpdateStatus, WatchFormField, WatchUi, WatchUiStatus,
 };
 use crate::history::HistoryEntry;
+use crate::target::CatchupMode;
 use crate::target::SyncMode;
 use crate::transfer::{Transfer, TransferState};
 
@@ -58,11 +59,147 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     if app.ssh_picker.is_some() {
         draw_ssh_picker(f, size, app, &palette);
     }
+    if app.watch_form.is_some() {
+        draw_watch_form(f, size, app, &palette);
+    }
+}
+
+fn draw_watch_form(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
+    let Some(form) = app.watch_form.as_ref() else {
+        return;
+    };
+    let w = 66.min(area.width.saturating_sub(4));
+    let opts_h = form.all_target_options.len().clamp(1, 6) as u16;
+    let h = (14 + opts_h).min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+    f.render_widget(Clear, rect);
+
+    let title = match form.mode {
+        crate::app::WatchFormMode::New => " Add watch ",
+        crate::app::WatchFormMode::Edit(_) => " Edit watch ",
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.accent))
+        .style(Style::default().bg(p.bg).fg(p.fg));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let mut lines: Vec<Line<'static>> = vec![
+        text_field_line(
+            "Name    ",
+            &form.name,
+            form.field == WatchFormField::Name,
+            p,
+        ),
+        text_field_line(
+            "Path    ",
+            &form.path,
+            form.field == WatchFormField::Path,
+            p,
+        ),
+        text_field_line(
+            "Patterns",
+            &form.patterns,
+            form.field == WatchFormField::Patterns,
+            p,
+        ),
+        Line::from(""),
+    ];
+
+    let t_focus = form.field == WatchFormField::Targets;
+    let t_label_style = if t_focus {
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.muted)
+    };
+    lines.push(Line::from(Span::styled(
+        " Targets (Space: toggle)",
+        t_label_style,
+    )));
+    for (i, name) in form.all_target_options.iter().enumerate() {
+        let checked = form.targets.iter().any(|n| n == name);
+        let on_cursor = t_focus && form.target_cursor == i;
+        let glyph = if checked { "[✓]" } else { "[ ]" };
+        let style = if on_cursor {
+            Style::default()
+                .bg(p.selection)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.fg)
+        };
+        lines.push(Line::from(vec![
+            Span::raw("   "),
+            Span::styled(format!("{glyph} {name}"), style),
+        ]));
+    }
+    lines.push(Line::from(""));
+
+    let c_focus = form.field == WatchFormField::Catchup;
+    let c_label_style = if c_focus {
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.muted)
+    };
+    let catchup_label = match form.catchup {
+        CatchupMode::Prompt => "prompt (badge on startup)",
+        CatchupMode::Auto => "auto (replay all newer)",
+        CatchupMode::Ignore => "ignore (forget the past)",
+    };
+    lines.push(Line::from(vec![
+        Span::styled(" Catchup ", c_label_style),
+        Span::raw(" "),
+        Span::styled(
+            format!("⟨ {catchup_label} ⟩"),
+            if c_focus {
+                Style::default().fg(p.accent)
+            } else {
+                Style::default().fg(p.fg)
+            },
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    if let Some(err) = &form.error {
+        lines.push(Line::from(Span::styled(
+            format!(" ⚠ {err}"),
+            Style::default().fg(p.diff_del),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        " Tab next · Shift+Tab prev · Enter save · Esc cancel",
+        Style::default().fg(p.muted),
+    )));
+
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn text_field_line(label: &str, value: &str, focused: bool, p: &theme::Palette) -> Line<'static> {
+    let label_style = if focused {
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.muted)
+    };
+    let value_style = if focused {
+        Style::default()
+            .fg(p.fg)
+            .bg(p.selection)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.fg)
+    };
+    let cursor = if focused { "▏" } else { "" };
+    Line::from(vec![
+        Span::styled(format!(" {label} "), label_style),
+        Span::styled(format!(" {value}{cursor} "), value_style),
+    ])
 }
 
 fn draw_tab_bar(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
-    let mut spans: Vec<Span> = Vec::new();
-    spans.push(Span::raw(" "));
+    let mut spans: Vec<Span> = vec![Span::raw(" ")];
     for (i, tab) in [Tab::Drop, Tab::Watch].iter().enumerate() {
         let active = app.current_tab == *tab;
         let key = match tab {
@@ -140,26 +277,24 @@ fn draw_watches(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette
     if app.watches.is_empty() {
         let hint = vec![
             Line::from(Span::styled(
-                "  No watches configured.",
+                "  No watches configured yet.",
                 Style::default().fg(p.muted),
             )),
             Line::from(""),
-            Line::from(Span::styled(
-                "  Add a [[watch]] block to your config.toml — see examples/",
-                Style::default().fg(p.muted),
-            )),
+            Line::from(vec![
+                Span::styled("  Press ", Style::default().fg(p.muted)),
+                Span::styled(
+                    "a",
+                    Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    " to add one — name, folder, and target, done.",
+                    Style::default().fg(p.muted),
+                ),
+            ]),
             Line::from(""),
-            Line::from(Span::styled("    [[watch]]", Style::default().fg(p.muted))),
             Line::from(Span::styled(
-                "    name    = \"screenshots\"",
-                Style::default().fg(p.muted),
-            )),
-            Line::from(Span::styled(
-                "    path    = \"~/Desktop\"",
-                Style::default().fg(p.muted),
-            )),
-            Line::from(Span::styled(
-                "    targets = [\"dev\"]",
+                "  (config.toml can also be edited by hand — see examples/)",
                 Style::default().fg(p.muted),
             )),
         ];
@@ -1296,6 +1431,8 @@ fn draw_help_overlay(f: &mut Frame<'_>, area: Rect, p: &theme::Palette) {
         Line::from("  Space              toggle target / watch folder"),
         Line::from("  Backspace          remove queued file under cursor"),
         Line::from("  click a row        copy that remote path to clipboard"),
+        Line::from(""),
+        Line::from("  Watch tab: a add · e edit · d delete · r catch up"),
         Line::from(""),
         Line::from(Span::styled(
             "  All letter shortcuts use Ctrl so nothing in a dragged",
