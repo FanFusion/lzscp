@@ -137,8 +137,12 @@ async fn run(
     // --progress works from rsync 2.6+ (macOS default 2.6.9) and emits
     // per-file progress lines. Newer versions also accept it.
     // --partial lets failed transfers resume from where they stopped.
+    // -r is needed for directories — without it rsync silently skips them
+    // ("skipping directory foo") and still exits 0, making the UI claim a
+    // completed transfer that actually moved nothing.
     cmd.arg("--progress")
         .arg("--partial")
+        .arg("-r")
         .arg("-e")
         .arg(&ssh_opt)
         .arg(local)

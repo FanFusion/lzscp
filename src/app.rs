@@ -1442,6 +1442,25 @@ impl App {
     }
 
     fn handle_paste(&mut self, raw: &str) {
+        // Guard: any modal/form open OR not on Drop tab must swallow the
+        // paste. Falling through to the queue is a data-loss class bug —
+        // pasting a path into the watch form would silently rsync it.
+        if self.watch_form.is_some() {
+            self.insert_paste_into_watch_form(raw);
+            return;
+        }
+        if self.ssh_picker.is_some()
+            || self.menu_visible
+            || self.help_visible
+            || self.watch_delete_confirm.is_some()
+        {
+            return;
+        }
+        // Paste only fires when the user is clearly intending to drop a
+        // file: Drop tab, DropZone pane focused. Anywhere else swallows.
+        if self.current_tab != Tab::Drop || self.focus != Focus::DropZone {
+            return;
+        }
         let parsed = path_input::parse_paste(raw);
         if parsed.is_empty() {
             self.last_paste_error = Some("empty paste".into());
@@ -1469,6 +1488,29 @@ impl App {
             }
         } else {
             self.last_paste_error = Some(format!("no valid path: {}", missing.join(", ")));
+        }
+    }
+
+    fn insert_paste_into_watch_form(&mut self, raw: &str) {
+        let Some(form) = self.watch_form.as_mut() else {
+            return;
+        };
+        // Only text fields accept character input. Targets / Catchup /
+        // Recursive are toggles — for those we just swallow.
+        let field = match form.field {
+            WatchFormField::Name => &mut form.name,
+            WatchFormField::Path => &mut form.path,
+            WatchFormField::Patterns => &mut form.patterns,
+            _ => return,
+        };
+        // Strip CR/LF so multi-line clipboards don't break layout. A path
+        // with a literal newline is almost certainly not what the user
+        // wanted anyway.
+        for ch in raw.chars() {
+            if ch == '\n' || ch == '\r' {
+                continue;
+            }
+            field.push(ch);
         }
     }
 

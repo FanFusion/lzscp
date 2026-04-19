@@ -147,12 +147,12 @@ fn draw_watch_form(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette)
         Style::default().fg(p.muted)
     };
     let catchup_label = match form.catchup {
-        CatchupMode::Prompt => "prompt (badge on startup)",
-        CatchupMode::Auto => "auto (replay all newer)",
-        CatchupMode::Ignore => "ignore (forget the past)",
+        CatchupMode::Prompt => "prompt on restart",
+        CatchupMode::Auto => "auto-sync all newer",
+        CatchupMode::Ignore => "ignore older files",
     };
     lines.push(Line::from(vec![
-        Span::styled(" Catchup ", c_label_style),
+        Span::styled(" Backlog ", c_label_style),
         Span::raw(" "),
         Span::styled(
             format!("⟨ {catchup_label} ⟩"),
