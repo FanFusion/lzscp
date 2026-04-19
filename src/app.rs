@@ -171,6 +171,7 @@ pub struct HitRegions {
     /// what the row represents).
     pub activity_rows: Vec<(Rect, usize, ActivityRef)>,
     pub help_bar_hits: Vec<(Rect, HelpBarAction)>,
+    pub tab_hits: Vec<(Rect, Tab)>,
     pub modal_area: Option<Rect>,
     pub modal_hits: Vec<(Rect, ModalHit)>,
     pub menu_rows: Vec<(Rect, MenuAction)>,
@@ -728,6 +729,14 @@ impl App {
             // Any click outside/inside the overlay dismisses it.
             self.help_visible = false;
             return;
+        }
+
+        // Tab labels in the header.
+        for (r, tab) in self.hit_regions.tab_hits.clone() {
+            if rect_contains(r, x, y) {
+                self.switch_tab(tab);
+                return;
+            }
         }
 
         // Help-bar chips.

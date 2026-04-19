@@ -37,6 +37,8 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
 
     draw_title(f, body_chunks[0], app, &palette);
     draw_tab_bar(f, body_chunks[1], app, &palette);
+    // draw_tab_bar mutates hit_regions.tab_hits, so it needs &mut App.
+    // (Kept signature identical above to keep the diff small.)
 
     match app.current_tab {
         Tab::Drop => draw_drop_tab_body(f, body_chunks[2], app, &palette),
@@ -198,25 +200,26 @@ fn text_field_line(label: &str, value: &str, focused: bool, p: &theme::Palette) 
     ])
 }
 
-fn draw_tab_bar(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
+fn draw_tab_bar(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
+    let mut cursor_x: u16 = area.x + 1; // account for leading space
     for (i, tab) in [Tab::Drop, Tab::Watch].iter().enumerate() {
         let active = app.current_tab == *tab;
-        let key = match tab {
-            Tab::Drop => "1",
-            Tab::Watch => "2",
-        };
         let style = if active {
-            Style::default()
-                .bg(p.accent)
-                .fg(p.bg)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(p.muted)
         };
-        spans.push(Span::styled(format!(" {} {} ", key, tab.label()), style));
+        let text = format!(" {} ", tab.label());
+        let text_w = text.chars().count() as u16;
+        app.hit_regions
+            .tab_hits
+            .push((Rect::new(cursor_x, area.y, text_w, 1), *tab));
+        cursor_x += text_w;
+        spans.push(Span::styled(text, style));
         if i == 0 {
             spans.push(Span::raw(" "));
+            cursor_x += 1;
         }
     }
     // Tail — show watch activity count when not on the Watch tab so the
@@ -723,11 +726,8 @@ fn draw_title(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) 
     };
     let title = Line::from(vec![
         Span::styled(
-            " lzsync ",
-            Style::default()
-                .bg(p.accent)
-                .fg(p.bg)
-                .add_modifier(Modifier::BOLD),
+            "lzsync",
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
         Span::styled(format!("v{}", crate::VERSION), Style::default().fg(p.muted)),

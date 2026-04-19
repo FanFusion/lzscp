@@ -1,6 +1,6 @@
 [package]
 name = "lzsync"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 description = "Lazy Sync — a local TUI for drag-drop & folder-watch file sync to SSH hosts with auto clipboard path return"
 readme = "README.md"
