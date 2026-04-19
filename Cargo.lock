@@ -1044,7 +1044,7 @@ dependencies = [
 
 [[package]]
 name = "lzscp"
-version = "0.2.4"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1055,6 +1055,7 @@ dependencies = [
  "ratatui",
  "regex",
  "serde",
+ "serde_json",
  "shellexpand",
  "shlex",
  "tempfile",

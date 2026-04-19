@@ -319,3 +319,37 @@ clipboard_format = "scp_style"
         );
     }
 }
+
+#[cfg(test)]
+mod round_trip_tests {
+    use super::*;
+    use crate::target::Target;
+    use tempfile::TempDir;
+
+    #[test]
+    fn targets_persist_across_save_and_reload() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        let mut cfg = Config::default();
+        cfg.default_target = Some("devjp".into());
+        cfg.targets.push(Target {
+            name: "devjp".into(),
+            host: "1.2.3.4".into(),
+            user: Some("ubuntu".into()),
+            remote_dir: "~/lzscp-inbox".into(),
+            ssh_port: Some(22),
+            ssh_key: Some("~/.ssh/id_ed25519".into()),
+            clipboard_format: None,
+        });
+
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        std::fs::write(&path, text).unwrap();
+
+        let loaded = parse_from(&path, false).unwrap();
+        assert_eq!(loaded.targets.len(), 1);
+        assert_eq!(loaded.targets[0].name, "devjp");
+        assert_eq!(loaded.targets[0].host, "1.2.3.4");
+        assert_eq!(loaded.default_target.as_deref(), Some("devjp"));
+    }
+}

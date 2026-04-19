@@ -74,6 +74,95 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     if app.ssh_picker.is_some() {
         draw_ssh_picker(f, size, app, &palette);
     }
+    if app.history_picker.is_some() {
+        draw_history_picker(f, size, app, &palette);
+    }
+}
+
+fn draw_history_picker(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
+    let query = app
+        .history_picker
+        .as_ref()
+        .map(|h| h.query.clone())
+        .unwrap_or_default();
+    let cursor = app.history_picker.as_ref().map(|h| h.cursor).unwrap_or(0);
+    let matches: Vec<crate::history::HistoryEntry> =
+        app.history.filter(&query).into_iter().cloned().collect();
+
+    let total = matches.len();
+    let h = ((total as u16 + 6).min(area.height.saturating_sub(4))).max(8);
+    let w = 92.min(area.width.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+    app.hit_regions.modal_area = Some(rect);
+    app.hit_regions.history_rows.clear();
+
+    let inner_w = w.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    // Search box line
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "filter ",
+            Style::default().fg(p.muted).add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            format!("{query}▏"),
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(Span::styled(
+        format!("  {} of {} shown", total, app.history.entries.len()),
+        Style::default().fg(p.muted),
+    )));
+    lines.push(Line::from(""));
+
+    // Entry rows. Clamp to fit modal height.
+    let max_row_idx = h.saturating_sub(6) as usize;
+    for (i, e) in matches.iter().enumerate().take(max_row_idx) {
+        let row_y = rect.y + 3 + (i as u16) + 1;
+        let time = crate::history::format_time_ago(e.synced_at);
+        let path_short = truncate_middle(&e.remote_path, 40);
+        let raw = format!(
+            "  {name}   → {target}   {remote}   {time}",
+            name = truncate_middle(&e.local_name, 26),
+            target = e.target_name,
+            remote = path_short,
+            time = time,
+        );
+        let padded = if raw.chars().count() < inner_w {
+            format!("{raw}{}", " ".repeat(inner_w - raw.chars().count()))
+        } else {
+            raw
+        };
+        let style = if i == cursor {
+            Style::default()
+                .fg(p.bg)
+                .bg(p.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.fg)
+        };
+        lines.push(Line::from(Span::styled(padded, style)));
+        app.hit_regions
+            .history_rows
+            .push((Rect::new(rect.x + 1, row_y, w.saturating_sub(2), 1), i));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Type to filter · Enter copy remote path · Esc close",
+        Style::default().fg(p.muted),
+    )));
+
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .title(" File history ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(p.bg).fg(p.fg));
+    f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 fn draw_ssh_picker(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {

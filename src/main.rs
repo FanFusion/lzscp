@@ -1,6 +1,7 @@
 mod app;
 mod clipboard;
 mod config;
+mod history;
 mod path_input;
 mod ssh_config;
 mod target;

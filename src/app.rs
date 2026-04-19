@@ -8,6 +8,7 @@ use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
 use crate::config::Config;
+use crate::history::{HistoryEntry, HistoryStatus, HistoryStore};
 use crate::path_input;
 use crate::target::{ClipboardFormat, SyncMode};
 use crate::transfer::{self, Transfer, TransferEvent, TransferState};
@@ -63,6 +64,7 @@ pub enum HelpBarAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
+    BrowseHistory,
     AddTargetFromSsh,
     RemoveCurrentTarget,
     ReprobeTargets,
@@ -80,6 +82,7 @@ pub enum MenuAction {
 impl MenuAction {
     pub fn label(self) -> &'static str {
         match self {
+            MenuAction::BrowseHistory => "Browse file history",
             MenuAction::AddTargetFromSsh => "Add target from ~/.ssh/config",
             MenuAction::RemoveCurrentTarget => "Remove selected target",
             MenuAction::ReprobeTargets => "Re-probe all targets",
@@ -97,6 +100,7 @@ impl MenuAction {
 
     pub fn shortcut(self) -> &'static str {
         match self {
+            MenuAction::BrowseHistory => "h",
             MenuAction::AddTargetFromSsh => "+",
             MenuAction::RemoveCurrentTarget => "-",
             MenuAction::ReprobeTargets => "r",
@@ -114,6 +118,7 @@ impl MenuAction {
 
     pub fn all() -> &'static [MenuAction] {
         &[
+            MenuAction::BrowseHistory,
             MenuAction::AddTargetFromSsh,
             MenuAction::RemoveCurrentTarget,
             MenuAction::ReprobeTargets,
@@ -150,7 +155,9 @@ pub struct HitRegions {
     pub modal_area: Option<Rect>,
     pub modal_hits: Vec<(Rect, ModalHit)>,
     pub menu_rows: Vec<(Rect, MenuAction)>,
-    pub ssh_picker_rows: Vec<Rect>, // indexes match app.ssh_picker.list
+    pub ssh_picker_rows: Vec<Rect>,
+    /// History picker rows — each row maps to an index into the filtered list
+    pub history_rows: Vec<(Rect, usize)>,
 }
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
@@ -188,6 +195,12 @@ pub struct SshPicker {
     pub cursor: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct HistoryPicker {
+    pub query: String,
+    pub cursor: usize,
+}
+
 pub struct App {
     pub cfg: Config,
     pub mode: SyncMode,
@@ -213,6 +226,8 @@ pub struct App {
     pub menu_cursor: usize,
 
     pub ssh_picker: Option<SshPicker>,
+    pub history_picker: Option<HistoryPicker>,
+    pub history: HistoryStore,
 
     pub update_status: UpdateStatus,
     pub hit_regions: HitRegions,
@@ -280,6 +295,8 @@ impl App {
             menu_visible: false,
             menu_cursor: 0,
             ssh_picker: None,
+            history_picker: None,
+            history: HistoryStore::load().unwrap_or_default(),
             update_status: UpdateStatus::Idle,
             hit_regions: HitRegions::default(),
             transfer_tx: tx,
@@ -452,6 +469,20 @@ impl App {
             }
             // Click outside picker dismisses.
             self.ssh_picker = None;
+            return;
+        }
+        if self.history_picker.is_some() {
+            let rows = self.hit_regions.history_rows.clone();
+            for (r, idx) in rows {
+                if rect_contains(r, x, y) {
+                    if let Some(hp) = self.history_picker.as_mut() {
+                        hp.cursor = idx;
+                    }
+                    self.history_copy_selected();
+                    return;
+                }
+            }
+            self.history_picker = None;
             return;
         }
         // Menu takes precedence (it's drawn on top of everything else).
@@ -647,6 +678,30 @@ impl App {
             }
             return;
         }
+        if self.history_picker.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.history_picker = None;
+                }
+                KeyCode::Up => self.history_move(-1),
+                KeyCode::Down | KeyCode::Tab => self.history_move(1),
+                KeyCode::Enter => self.history_copy_selected(),
+                KeyCode::Backspace => {
+                    if let Some(hp) = self.history_picker.as_mut() {
+                        hp.query.pop();
+                        hp.cursor = 0;
+                    }
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(hp) = self.history_picker.as_mut() {
+                        hp.query.push(c);
+                        hp.cursor = 0;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.menu_visible {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
@@ -685,6 +740,7 @@ impl App {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.help_visible = true,
             KeyCode::Char('u') => self.start_update_check(),
+            KeyCode::Char('h') => self.open_history_picker(),
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.menu_visible = true;
                 self.menu_cursor = 0;
@@ -741,6 +797,7 @@ impl App {
 
     fn run_menu_action(&mut self, a: MenuAction) {
         match a {
+            MenuAction::BrowseHistory => self.open_history_picker(),
             MenuAction::AddTargetFromSsh => self.open_ssh_picker(),
             MenuAction::RemoveCurrentTarget => self.remove_current_target(),
             MenuAction::CheckUpdate => self.start_update_check(),
@@ -781,6 +838,70 @@ impl App {
             }
             MenuAction::Help => self.help_visible = true,
             MenuAction::Quit => self.should_quit = true,
+        }
+    }
+
+    pub fn open_history_picker(&mut self) {
+        if self.history.entries.is_empty() {
+            self.toast("no history yet — sync a file first");
+            return;
+        }
+        self.history_picker = Some(HistoryPicker::default());
+    }
+
+    fn history_move(&mut self, delta: i32) {
+        let matches = self.history.filter(&self.history_picker_query());
+        let n = matches.len();
+        if n == 0 {
+            return;
+        }
+        if let Some(hp) = self.history_picker.as_mut() {
+            let cur = hp.cursor as i32;
+            hp.cursor = ((cur + delta).rem_euclid(n as i32)) as usize;
+        }
+    }
+
+    fn history_picker_query(&self) -> String {
+        self.history_picker
+            .as_ref()
+            .map(|h| h.query.clone())
+            .unwrap_or_default()
+    }
+
+    fn history_copy_selected(&mut self) {
+        let query = self.history_picker_query();
+        let cursor = self.history_picker.as_ref().map(|h| h.cursor).unwrap_or(0);
+        let matches = self.history.filter(&query);
+        let Some(e) = matches.get(cursor).cloned().cloned() else {
+            return;
+        };
+        self.history_picker = None;
+
+        // Render clipboard via current format. We look the target up from cfg
+        // (if still present), else fall back to storing the raw remote_path.
+        let text = if let Some(t) = self.cfg.target_by_name(&e.target_name) {
+            crate::clipboard::render(
+                t,
+                std::path::Path::new(&e.local_path),
+                std::path::Path::new(&e.remote_path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+                    .as_str(),
+                self.clipboard_format,
+                &self.cfg.clipboard_template,
+            )
+        } else {
+            e.remote_path.clone()
+        };
+        match crate::clipboard::write(&text) {
+            Ok(()) => {
+                self.last_clipboard = Some(text.clone());
+                self.toast(&format!("clipboard ← {}", trunc(&text, 60)));
+            }
+            Err(e) => {
+                self.toast(&format!("clipboard error: {e}"));
+            }
         }
     }
 
@@ -1176,6 +1297,7 @@ impl App {
                     }
                     None => return,
                 };
+                self.record_history(&target_name, &local, &remote_abs_dir);
                 self.update_clipboard_for_completed(&target_name, &local, &remote_abs_dir);
             }
             TransferEvent::Failed { id, error } => {
@@ -1191,6 +1313,39 @@ impl App {
     fn transfer_mut(&mut self, id: u64) -> Option<&mut Transfer> {
         let idx = *self.transfer_index.get(&id)?;
         self.transfers.get_mut(idx)
+    }
+
+    fn record_history(&mut self, target_name: &str, local: &std::path::Path, remote_abs_dir: &str) {
+        let Some(target) = self.cfg.target_by_name(target_name) else {
+            return;
+        };
+        let local_abs = std::fs::canonicalize(local)
+            .unwrap_or_else(|_| local.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
+        let local_name = local
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let remote_path = format!("{}/{}", remote_abs_dir.trim_end_matches('/'), local_name);
+        let target_host = match &target.user {
+            Some(u) => format!("{u}@{}", target.host),
+            None => target.host.clone(),
+        };
+        let size = std::fs::metadata(local).map(|m| m.len()).unwrap_or(0);
+        let entry = HistoryEntry {
+            local_path: local_abs,
+            local_name,
+            size,
+            target_name: target_name.to_string(),
+            target_host,
+            remote_path,
+            synced_at: crate::history::now_epoch(),
+            status: HistoryStatus::Completed,
+        };
+        if let Err(e) = self.history.append(entry) {
+            self.toast(&format!("history append failed: {e}"));
+        }
     }
 
     fn recopy_completed(&mut self, id: u64) {
