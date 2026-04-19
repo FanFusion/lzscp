@@ -98,18 +98,18 @@ impl MenuAction {
 
     pub fn shortcut(self) -> &'static str {
         match self {
-            MenuAction::AddTargetFromSsh => "+",
-            MenuAction::RemoveCurrentTarget => "-",
-            MenuAction::ReprobeTargets => "r",
-            MenuAction::InstallRsyncOnSelected => "i",
-            MenuAction::ClearProgressHistory => "X",
-            MenuAction::ToggleMode => "a/m",
-            MenuAction::CycleClipboardFormat => "c",
-            MenuAction::CycleTheme => "t",
-            MenuAction::ClearQueue => "x",
-            MenuAction::CheckUpdate => "u",
-            MenuAction::Help => "?",
-            MenuAction::Quit => "q",
+            MenuAction::AddTargetFromSsh => "",
+            MenuAction::RemoveCurrentTarget => "",
+            MenuAction::ReprobeTargets => "",
+            MenuAction::InstallRsyncOnSelected => "",
+            MenuAction::ClearProgressHistory => "",
+            MenuAction::ToggleMode => "^A / ^N",
+            MenuAction::CycleClipboardFormat => "^F",
+            MenuAction::CycleTheme => "^T",
+            MenuAction::ClearQueue => "",
+            MenuAction::CheckUpdate => "^U",
+            MenuAction::Help => "^H",
+            MenuAction::Quit => "^Q",
         }
     }
 
@@ -617,13 +617,10 @@ impl App {
                 }
             }
             HelpBarAction::Sync => self.start_queue_sync(),
-            HelpBarAction::CycleMode => {
-                self.mode = match self.mode {
-                    SyncMode::Auto => SyncMode::Manual,
-                    SyncMode::Manual => SyncMode::Auto,
-                };
-                self.toast(&format!("mode: {:?}", self.mode).to_lowercase());
-            }
+            HelpBarAction::CycleMode => self.set_mode(match self.mode {
+                SyncMode::Auto => SyncMode::Manual,
+                SyncMode::Manual => SyncMode::Auto,
+            }),
             HelpBarAction::CycleClipboard => self.cycle_clipboard_format(),
             HelpBarAction::CheckUpdate => self.start_update_check(),
             HelpBarAction::ToggleHelp => self.help_visible = !self.help_visible,
@@ -737,23 +734,15 @@ impl App {
             }
             return;
         }
-        // When focus is the DropZone we do NOT fire any letter shortcut:
-        // some terminals deliver dragged paths as a burst of key events
-        // (not bracketed paste), and letters in the path like "t" or "q"
-        // would otherwise cycle theme or quit. Control keys (Tab, Enter,
-        // Backspace, Delete, arrows, Esc) and ctrl-combinations still work.
-        let in_drop_zone = self.focus == Focus::DropZone;
-
+        // Every global shortcut is Ctrl+letter. Paths dragged into the
+        // terminal as raw characters can't contain Ctrl modifiers, so this
+        // is the only layer that never collides with drag-and-drop.
+        // Plain letters / digits / `?` are free for paste and filter input.
         match key.code {
-            // ---- always-available keys (don't collide with path chars) ----
             KeyCode::Tab => self.cycle_focus(1),
             KeyCode::BackTab => self.cycle_focus(-1),
             KeyCode::Up => self.move_cursor(-1),
             KeyCode::Down => self.move_cursor(1),
-            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.menu_visible = true;
-                self.menu_cursor = 0;
-            }
             KeyCode::Enter => {
                 if self.focus == Focus::Progress {
                     self.copy_activity_cursor();
@@ -761,7 +750,7 @@ impl App {
                     self.start_queue_sync();
                 }
             }
-            KeyCode::Delete | KeyCode::Backspace if in_drop_zone => {
+            KeyCode::Delete | KeyCode::Backspace if self.focus == Focus::DropZone => {
                 if !self.queue.is_empty() && self.queue_cursor < self.queue.len() {
                     self.queue.remove(self.queue_cursor);
                     if self.queue_cursor >= self.queue.len() && self.queue_cursor > 0 {
@@ -769,29 +758,32 @@ impl App {
                     }
                 }
             }
-
-            // ---- letter shortcuts: inactive in DropZone (paste-safe) ----
-            KeyCode::Char(_) if in_drop_zone => {}
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('?') => self.help_visible = true,
-            KeyCode::Char('u') => self.start_update_check(),
-            KeyCode::Char('/') if self.focus == Focus::Progress => {
-                self.activity_filter = Some(String::new());
-            }
-            KeyCode::Char('t') => self.cycle_theme(),
-            KeyCode::Char('a') => {
-                self.mode = SyncMode::Auto;
-                self.toast("mode: auto");
-            }
-            KeyCode::Char('m') => {
-                self.mode = SyncMode::Manual;
-                self.toast("mode: manual");
-            }
-            KeyCode::Char('c') => self.cycle_clipboard_format(),
+            // Ctrl+letter shortcuts. Ctrl+C is handled earlier in this
+            // function as "quit", so it's not listed here.
+            KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => match c {
+                'p' => {
+                    self.menu_visible = true;
+                    self.menu_cursor = 0;
+                }
+                'q' => self.should_quit = true,
+                'h' => self.help_visible = !self.help_visible,
+                'u' => self.start_update_check(),
+                't' => self.cycle_theme(),
+                'a' => self.set_mode(SyncMode::Auto),
+                'n' => self.set_mode(SyncMode::Manual),
+                'f' => {
+                    if self.focus == Focus::Progress {
+                        self.activity_filter = Some(String::new());
+                    } else {
+                        self.cycle_clipboard_format();
+                    }
+                }
+                _ => {}
+            },
+            // Space / 1–9 still act as Targets-panel conveniences — they
+            // fire ONLY when Targets is focused, so a path dropped into the
+            // DropZone can't toggle anything.
             KeyCode::Char(' ') if self.focus == Focus::Targets => self.toggle_target_cursor(),
-            // 1–9: quick-toggle Nth target. Only when focus is on the Targets
-            // panel — otherwise digits in a pasted/dragged path would toggle
-            // targets.
             KeyCode::Char(d @ '1'..='9') if self.focus == Focus::Targets => {
                 let idx = (d as u8 - b'1') as usize;
                 if idx < self.target_rows.len() {
@@ -803,6 +795,13 @@ impl App {
         }
     }
 
+    fn set_mode(&mut self, m: SyncMode) {
+        self.mode = m;
+        self.cfg.default_mode = m;
+        self.toast(&format!("mode: {:?}", m).to_lowercase());
+        self.persist_config();
+    }
+
     fn cycle_theme(&mut self) {
         let themes = ["mocha", "tokyo_night", "gruvbox", "nord", "dracula"];
         let cur = themes
@@ -812,6 +811,9 @@ impl App {
         let next = (cur + 1) % themes.len();
         self.cfg.theme = themes[next].to_string();
         self.toast(&format!("theme: {}", themes[next]));
+        // Persist so the next launch boots with the user's last pick. Same
+        // for clipboard format / mode below.
+        self.persist_config();
     }
 
     fn run_menu_action(&mut self, a: MenuAction) {
@@ -839,13 +841,10 @@ impl App {
                 self.transfer_index.clear();
                 self.toast(&format!("cleared {n} transfer(s)"));
             }
-            MenuAction::ToggleMode => {
-                self.mode = match self.mode {
-                    SyncMode::Auto => SyncMode::Manual,
-                    SyncMode::Manual => SyncMode::Auto,
-                };
-                self.toast(&format!("mode: {:?}", self.mode).to_lowercase());
-            }
+            MenuAction::ToggleMode => self.set_mode(match self.mode {
+                SyncMode::Auto => SyncMode::Manual,
+                SyncMode::Manual => SyncMode::Auto,
+            }),
             MenuAction::CycleClipboardFormat => self.cycle_clipboard_format(),
             MenuAction::CycleTheme => self.cycle_theme(),
             MenuAction::ClearQueue => {
@@ -1269,7 +1268,12 @@ impl App {
             SshPath => Custom,
             Custom => RemotePath,
         };
+        // Mirror into cfg so persist_config picks it up — the TUI tracks
+        // clipboard_format separately for ergonomic reasons but the
+        // on-disk source of truth is cfg.clipboard_format.
+        self.cfg.clipboard_format = self.clipboard_format;
         self.toast(&format!("clipboard: {:?}", self.clipboard_format));
+        self.persist_config();
     }
 
     fn selected_target_names(&self) -> Vec<String> {

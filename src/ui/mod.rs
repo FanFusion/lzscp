@@ -1003,10 +1003,10 @@ fn draw_help_bar(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palett
     let chips: [(&str, &str, HelpBarAction); 6] = [
         ("Tab", "focus", HelpBarAction::CycleFocus),
         ("Enter", "sync", HelpBarAction::Sync),
-        ("u", "update", HelpBarAction::CheckUpdate),
-        ("Ctrl+P", "menu", HelpBarAction::OpenMenu),
-        ("?", "help", HelpBarAction::ToggleHelp),
-        ("q", "quit", HelpBarAction::Quit),
+        ("^U", "update", HelpBarAction::CheckUpdate),
+        ("^P", "menu", HelpBarAction::OpenMenu),
+        ("^H", "help", HelpBarAction::ToggleHelp),
+        ("^Q", "quit", HelpBarAction::Quit),
     ];
 
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(chips.len() * 3);
@@ -1057,27 +1057,27 @@ fn draw_help_overlay(f: &mut Frame<'_>, area: Rect, p: &theme::Palette) {
         .style(Style::default().bg(p.bg).fg(p.fg));
     let lines = vec![
         Line::from("  Ctrl+P             open menu / command palette"),
+        Line::from("  Ctrl+H             toggle this help"),
+        Line::from("  Ctrl+Q / Ctrl+C    quit"),
+        Line::from("  Ctrl+U             check for update"),
+        Line::from("  Ctrl+T             cycle theme"),
+        Line::from("  Ctrl+A / Ctrl+N    auto / manual mode"),
+        Line::from("  Ctrl+F             cycle clipboard format (or filter in Activity)"),
+        Line::from(""),
         Line::from("  Tab / Shift+Tab    cycle focus"),
         Line::from("  Up / Down          move cursor"),
+        Line::from("  Enter              sync (DropZone) or copy (Activity)"),
         Line::from("  Space              toggle selected target (Targets focus)"),
         Line::from("  1–9                quick-toggle Nth target (Targets focus)"),
-        Line::from("  Enter              sync (DropZone) or copy (Activity)"),
-        Line::from("  /                  filter Activity (Activity focus)"),
-        Line::from("  click a row        copy that remote path to clipboard"),
-        Line::from("  a / m              auto / manual mode"),
-        Line::from("  c                  cycle clipboard format"),
-        Line::from("  t                  cycle theme"),
-        Line::from("  u                  check for update"),
         Line::from("  Backspace          remove queued file under cursor"),
-        Line::from("  ?                  toggle this help"),
-        Line::from("  q / Ctrl+C         quit"),
+        Line::from("  click a row        copy that remote path to clipboard"),
         Line::from(""),
         Line::from(Span::styled(
-            "  Letter shortcuts are disabled while DropZone is focused so",
+            "  All letter shortcuts use Ctrl so nothing in a dragged",
             Style::default().fg(p.muted),
         )),
         Line::from(Span::styled(
-            "  drag-and-drop paths can't trigger them. Tab away to use them.",
+            "  path can trigger them by accident.",
             Style::default().fg(p.muted),
         )),
     ];
