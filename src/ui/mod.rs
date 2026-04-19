@@ -9,8 +9,9 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use crate::app::{
     App, Focus, HelpBarAction, HitRegions, ModalHit, TargetKind, TargetStatus, UpdateStatus,
 };
+use crate::history::HistoryEntry;
 use crate::target::SyncMode;
-use crate::transfer::TransferState;
+use crate::transfer::{Transfer, TransferState};
 
 pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     let palette = theme::palette(&app.cfg.theme);
@@ -19,25 +20,21 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     // Reset hit-test regions for this frame.
     app.hit_regions = HitRegions::default();
 
-    // New ergonomic layout (Mac dock is at the bottom → drag motion goes
-    // upward from the bottom edge of the terminal, so Drop zone lives there).
-    //
-    //   Title
-    //   Targets │ Progress   (50/50 split, fixed 9 lines)
-    //   Clipboard strip      (1 line — the primary output of the app)
-    //   Drop zone            (flexible, takes remaining vertical space)
-    //   Toast                (1 line)
+    // Layout:
+    //   Title                (1 line)
+    //   Targets │ Activity   (grow, 50/50 split)
+    //   Drop zone            (fixed 8 lines, at the bottom where Mac dock is)
+    //   Toast                (1 line — the sole clipboard/status feedback)
     //   Help bar             (1 line)
-    // Targets + progress share the top half dynamically; drop zone is a
-    // fixed, smaller strip at the bottom so the rest of the UI gets room to
-    // breathe on tall terminals.
-    let drop_zone_h = 8.min(size.height.saturating_sub(6));
+    //
+    // The old top "clipboard strip" was removed because the toast right above
+    // the help bar already shows the last clipboard write.
+    let drop_zone_h = 8.min(size.height.saturating_sub(5));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),           // title
-            Constraint::Min(9),              // targets + progress row (grows)
-            Constraint::Length(1),           // clipboard strip
+            Constraint::Min(9),              // targets + activity row (grows)
             Constraint::Length(drop_zone_h), // drop zone (fixed, compact)
             Constraint::Length(1),           // toast
             Constraint::Length(1),           // help bar
@@ -51,15 +48,14 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
 
     app.hit_regions.targets_panel = tp_row[0];
     app.hit_regions.progress_panel = tp_row[1];
-    app.hit_regions.drop_zone = chunks[3];
+    app.hit_regions.drop_zone = chunks[2];
 
     draw_title(f, chunks[0], app, &palette);
     draw_targets(f, tp_row[0], app, &palette);
-    draw_progress(f, tp_row[1], app, &palette);
-    draw_clipboard_strip(f, chunks[2], app, &palette);
-    draw_drop_zone(f, chunks[3], app, &palette);
-    draw_toast(f, chunks[4], app, &palette);
-    draw_help_bar(f, chunks[5], app, &palette);
+    draw_activity(f, tp_row[1], app, &palette);
+    draw_drop_zone(f, chunks[2], app, &palette);
+    draw_toast(f, chunks[3], app, &palette);
+    draw_help_bar(f, chunks[4], app, &palette);
 
     if app.help_visible {
         draw_help_overlay(f, size, &palette);
@@ -74,95 +70,6 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     if app.ssh_picker.is_some() {
         draw_ssh_picker(f, size, app, &palette);
     }
-    if app.history_picker.is_some() {
-        draw_history_picker(f, size, app, &palette);
-    }
-}
-
-fn draw_history_picker(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
-    let query = app
-        .history_picker
-        .as_ref()
-        .map(|h| h.query.clone())
-        .unwrap_or_default();
-    let cursor = app.history_picker.as_ref().map(|h| h.cursor).unwrap_or(0);
-    let matches: Vec<crate::history::HistoryEntry> =
-        app.history.filter(&query).into_iter().cloned().collect();
-
-    let total = matches.len();
-    let h = ((total as u16 + 6).min(area.height.saturating_sub(4))).max(8);
-    let w = 92.min(area.width.saturating_sub(4));
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let rect = Rect::new(x, y, w, h);
-    app.hit_regions.modal_area = Some(rect);
-    app.hit_regions.history_rows.clear();
-
-    let inner_w = w.saturating_sub(2) as usize;
-    let mut lines: Vec<Line> = Vec::new();
-    // Search box line
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(
-            "filter ",
-            Style::default().fg(p.muted).add_modifier(Modifier::DIM),
-        ),
-        Span::styled(
-            format!("{query}▏"),
-            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    lines.push(Line::from(Span::styled(
-        format!("  {} of {} shown", total, app.history.entries.len()),
-        Style::default().fg(p.muted),
-    )));
-    lines.push(Line::from(""));
-
-    // Entry rows. Clamp to fit modal height.
-    let max_row_idx = h.saturating_sub(6) as usize;
-    for (i, e) in matches.iter().enumerate().take(max_row_idx) {
-        let row_y = rect.y + 3 + (i as u16) + 1;
-        let time = crate::history::format_time_ago(e.synced_at);
-        let path_short = truncate_middle(&e.remote_path, 40);
-        let raw = format!(
-            "  {name}   → {target}   {remote}   {time}",
-            name = truncate_middle(&e.local_name, 26),
-            target = e.target_name,
-            remote = path_short,
-            time = time,
-        );
-        let padded = if raw.chars().count() < inner_w {
-            format!("{raw}{}", " ".repeat(inner_w - raw.chars().count()))
-        } else {
-            raw
-        };
-        let style = if i == cursor {
-            Style::default()
-                .fg(p.bg)
-                .bg(p.accent)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(p.fg)
-        };
-        lines.push(Line::from(Span::styled(padded, style)));
-        app.hit_regions
-            .history_rows
-            .push((Rect::new(rect.x + 1, row_y, w.saturating_sub(2), 1), i));
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  Type to filter · Enter copy remote path · Esc close",
-        Style::default().fg(p.muted),
-    )));
-
-    f.render_widget(Clear, rect);
-    let block = Block::default()
-        .title(" File history ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
-        .style(Style::default().bg(p.bg).fg(p.fg));
-    f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 fn draw_ssh_picker(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
@@ -229,40 +136,6 @@ fn draw_ssh_picker(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Pale
         .border_style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
         .style(Style::default().bg(p.bg).fg(p.fg));
     f.render_widget(Paragraph::new(lines).block(block), rect);
-}
-
-fn draw_clipboard_strip(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
-    let line = match &app.last_clipboard {
-        Some(v) => Line::from(vec![
-            Span::styled(
-                " ✓ clipboard ",
-                Style::default()
-                    .fg(p.bg)
-                    .bg(p.diff_add)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                truncate_middle(v, area.width.saturating_sub(14) as usize),
-                Style::default().fg(p.accent),
-            ),
-        ]),
-        None => Line::from(vec![
-            Span::styled(
-                " clipboard ",
-                Style::default().fg(p.muted).add_modifier(Modifier::DIM),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                "(drop a file and the remote path lands here)",
-                Style::default().fg(p.muted),
-            ),
-        ]),
-    };
-    f.render_widget(
-        Paragraph::new(line).style(Style::default().bg(p.bg).fg(p.fg)),
-        area,
-    );
 }
 
 fn draw_toast(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
@@ -733,164 +606,260 @@ fn draw_targets(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette
     f.render_widget(List::new(items).block(block), area);
 }
 
-fn draw_progress(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
+/// Unified Activity panel: live transfers at the top, then history rows
+/// (click any to re-copy the remote path, `/` to filter). Each row is a
+/// single hard-width line so long CJK/emoji names can never overflow.
+fn draw_activity(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
     let focused = app.focus == Focus::Progress;
-    let block = Block::default()
-        .title(Line::from(" Progress "))
-        .borders(Borders::ALL)
-        .border_style(border_style(focused, p))
-        .style(Style::default().fg(p.fg).bg(p.bg));
+    let filter_active = app.activity_filter.is_some();
+    let query = app.activity_query().to_lowercase();
 
-    if app.transfers.is_empty() {
-        let hint = Paragraph::new(Line::from(Span::styled(
-            "  (no transfers yet)",
-            Style::default().fg(p.muted),
-        )))
-        .block(block);
-        f.render_widget(hint, area);
-        return;
-    }
-
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    // Each transfer takes 2 lines: a caption row with target/file/percent/rate
-    // and a bar row with a clearly visible filled/unfilled gauge.
-    let recent_budget = (inner.height / 2) as usize;
-    let recent: Vec<_> = app
+    // Live = anything not yet recorded in history (record_history only runs
+    // on Completed, so Completed rows migrate to history automatically).
+    let live: Vec<&Transfer> = app
         .transfers
         .iter()
         .rev()
-        .take(recent_budget.max(1))
+        .filter(|t| t.state != TransferState::Completed)
+        .filter(|t| {
+            if query.is_empty() {
+                return true;
+            }
+            let fname = t
+                .local
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            fname.to_lowercase().contains(&query) || t.target_name.to_lowercase().contains(&query)
+        })
         .collect();
-    if recent.is_empty() {
+    let history_matches: Vec<HistoryEntry> = app
+        .history
+        .filter(&app.activity_query())
+        .into_iter()
+        .cloned()
+        .collect();
+
+    let title = if filter_active {
+        Line::from(vec![
+            Span::raw(" Activity "),
+            Span::styled(
+                format!("· {} shown ", live.len() + history_matches.len()),
+                Style::default().fg(p.muted),
+            ),
+        ])
+    } else if app.history.entries.is_empty() && live.is_empty() {
+        Line::from(" Activity ")
+    } else {
+        Line::from(vec![
+            Span::raw(" Activity "),
+            Span::styled(
+                format!(
+                    "· {} live · {} in history ",
+                    live.len(),
+                    app.history.entries.len()
+                ),
+                Style::default().fg(p.muted),
+            ),
+        ])
+    };
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(border_style(focused, p))
+        .style(Style::default().fg(p.fg).bg(p.bg));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.width < 16 || inner.height == 0 {
+        return;
+    }
+    let inner_w = inner.width as usize;
+    let mut y_off: u16 = 0;
+
+    // Filter bar (only when active).
+    if filter_active {
+        let q = app.activity_query();
+        let line = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "/",
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(q, Style::default().fg(p.fg)),
+            Span::styled("▏", Style::default().fg(p.accent)),
+            Span::raw("  "),
+            Span::styled(
+                "Esc to close",
+                Style::default().fg(p.muted).add_modifier(Modifier::DIM),
+            ),
+        ]);
+        f.render_widget(
+            Paragraph::new(line).style(Style::default().bg(p.bg)),
+            Rect::new(inner.x, inner.y + y_off, inner.width, 1),
+        );
+        y_off += 1;
+    }
+
+    if live.is_empty() && history_matches.is_empty() {
+        if y_off < inner.height {
+            let hint = if filter_active {
+                "  no matches"
+            } else {
+                "  drop a file to start — history will appear here"
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(p.muted))))
+                    .style(Style::default().bg(p.bg)),
+                Rect::new(inner.x, inner.y + y_off, inner.width, 1),
+            );
+        }
         return;
     }
 
-    let row_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(vec![Constraint::Length(2); recent.len()])
-        .split(inner);
-
-    for (i, t) in recent.iter().enumerate() {
-        let slot = row_chunks[i];
-        if slot.height < 2 {
-            continue;
+    // Live section.
+    for t in &live {
+        if y_off >= inner.height {
+            break;
         }
-        let caption_area = Rect::new(slot.x, slot.y, slot.width, 1);
-        let bar_area = Rect::new(slot.x, slot.y + 1, slot.width, 1);
-        // Register the full row (caption + bar) as a click target mapped to
-        // this transfer's id. Clicking a completed row re-copies its path.
-        app.hit_regions
-            .progress_rows
-            .push((Rect::new(slot.x, slot.y, slot.width, 2), t.id));
+        let y = inner.y + y_off;
+        let line = render_live_line(t, inner_w, p);
+        let rect = Rect::new(inner.x, y, inner.width, 1);
+        f.render_widget(Paragraph::new(line).style(Style::default().bg(p.bg)), rect);
+        app.hit_regions.progress_rows.push((rect, t.id));
+        y_off += 1;
+    }
 
-        let color = match t.state {
-            TransferState::Completed => p.diff_add,
-            TransferState::Failed => p.diff_del,
-            TransferState::Running => p.accent,
-            TransferState::Pending => p.muted,
-        };
-        let (icon, icon_style) = match t.state {
-            TransferState::Completed => (
-                "✓",
-                Style::default().fg(p.diff_add).add_modifier(Modifier::BOLD),
-            ),
-            TransferState::Failed => (
-                "✗",
-                Style::default().fg(p.diff_del).add_modifier(Modifier::BOLD),
-            ),
-            TransferState::Running => ("●", Style::default().fg(p.accent)),
-            TransferState::Pending => ("·", Style::default().fg(p.muted)),
-        };
+    // Thin divider if both sections are present and there's room.
+    if !live.is_empty() && !history_matches.is_empty() && y_off < inner.height && inner.height > 2 {
+        // Skip — no divider needed; the transfers-vs-history distinction is
+        // implicit in the icon colour (● running/✗ failed vs ✓ past).
+    }
 
-        let filename = t
-            .local
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        // Allow up to ~60% of the panel width for the filename so the rate
-        // column always fits.
-        let fname_budget = (slot.width as usize).saturating_sub(28);
-        let filename_short = truncate_middle(&filename, fname_budget.max(10));
-
-        let percent = t.percent.min(100);
-        let rate_text = if t.rate.is_empty() || percent == 100 {
-            String::new()
-        } else {
-            format!(" {}", t.rate)
-        };
-        let pct_text = format!(" {percent:>3}%");
-
-        let trailing = match t.state {
-            TransferState::Completed => Span::styled(
-                "  📋 click to copy".to_string(),
-                Style::default().fg(p.muted),
-            ),
-            TransferState::Failed => Span::styled(
-                format!(
-                    "  {}",
-                    t.last_error
-                        .as_deref()
-                        .map(|e| truncate_middle(e, 48))
-                        .unwrap_or_default()
-                ),
-                Style::default().fg(p.diff_del),
-            ),
-            _ => Span::raw(""),
-        };
-        let caption = Line::from(vec![
-            Span::raw(" "),
-            Span::styled(icon, icon_style),
-            Span::raw(" "),
-            Span::styled(
-                t.target_name.clone(),
-                Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(filename_short, Style::default().fg(p.fg)),
-            Span::raw("  "),
-            Span::styled(pct_text, Style::default().fg(color)),
-            Span::styled(rate_text, Style::default().fg(p.muted)),
-            trailing,
-        ]);
-        f.render_widget(
-            Paragraph::new(caption).style(Style::default().bg(p.bg)),
-            caption_area,
-        );
-
-        draw_bar(f, bar_area, percent, color, p);
+    // History section.
+    for (i, e) in history_matches.iter().enumerate() {
+        if y_off >= inner.height {
+            break;
+        }
+        let y = inner.y + y_off;
+        let line = render_history_line(e, inner_w, p);
+        let rect = Rect::new(inner.x, y, inner.width, 1);
+        f.render_widget(Paragraph::new(line).style(Style::default().bg(p.bg)), rect);
+        app.hit_regions.history_rows.push((rect, i));
+        y_off += 1;
     }
 }
 
-/// Render a solid progress bar row with a clearly visible unfilled track.
-fn draw_bar(
-    f: &mut Frame<'_>,
-    area: Rect,
-    percent: u8,
-    fill: ratatui::style::Color,
+const TARGET_COL: usize = 10;
+const LEFT_FIXED: usize = 1 /*sp*/ + 1 /*icon*/ + 2 /*sp*/ + TARGET_COL + 2; /*sp*/
+const RIGHT_GUTTER: usize = 2;
+
+fn render_live_line(t: &Transfer, inner_w: usize, p: &theme::Palette) -> Line<'static> {
+    let (icon, icon_color) = match t.state {
+        TransferState::Running => ("●", p.accent),
+        TransferState::Pending => ("·", p.muted),
+        TransferState::Failed => ("✗", p.diff_del),
+        TransferState::Completed => ("✓", p.diff_add),
+    };
+    let target = pad_or_trunc(&t.target_name, TARGET_COL);
+
+    let right = match t.state {
+        TransferState::Running => {
+            if t.rate.is_empty() {
+                format!("{:>3}%", t.percent.min(100))
+            } else {
+                format!("{:>3}%  {}", t.percent.min(100), t.rate)
+            }
+        }
+        TransferState::Pending => "queued".to_string(),
+        TransferState::Failed => t
+            .last_error
+            .as_deref()
+            .map(|e| truncate_cols(e, 30))
+            .unwrap_or_else(|| "failed".to_string()),
+        TransferState::Completed => "100%".to_string(),
+    };
+    let right_style = match t.state {
+        TransferState::Running => Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        TransferState::Pending => Style::default().fg(p.muted),
+        TransferState::Failed => Style::default().fg(p.diff_del),
+        TransferState::Completed => Style::default().fg(p.diff_add),
+    };
+
+    let filename = t
+        .local
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    build_row_line(
+        icon,
+        icon_color,
+        target,
+        filename,
+        p.fg,
+        right,
+        right_style,
+        inner_w,
+        p,
+    )
+}
+
+fn render_history_line(e: &HistoryEntry, inner_w: usize, p: &theme::Palette) -> Line<'static> {
+    let target = pad_or_trunc(&e.target_name, TARGET_COL);
+    let right = crate::history::format_time_ago(e.synced_at);
+    build_row_line(
+        "✓",
+        p.diff_add,
+        target,
+        e.local_name.clone(),
+        p.fg,
+        right,
+        Style::default().fg(p.muted),
+        inner_w,
+        p,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_row_line(
+    icon: &'static str,
+    icon_color: ratatui::style::Color,
+    target: String,
+    filename: String,
+    name_fg: ratatui::style::Color,
+    right: String,
+    right_style: Style,
+    inner_w: usize,
     p: &theme::Palette,
-) {
-    let width = area.width as usize;
-    if width == 0 {
-        return;
-    }
-    let filled = (width as u32 * percent.min(100) as u32 / 100) as usize;
-    let unfilled = width.saturating_sub(filled);
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(2);
-    if filled > 0 {
-        spans.push(Span::styled("█".repeat(filled), Style::default().fg(fill)));
-    }
-    if unfilled > 0 {
-        spans.push(Span::styled(
-            "─".repeat(unfilled),
-            Style::default().fg(p.muted),
-        ));
-    }
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(p.bg)),
-        area,
-    );
+) -> Line<'static> {
+    let right_w = display_width(&right);
+    let fname_budget = inner_w
+        .saturating_sub(LEFT_FIXED)
+        .saturating_sub(right_w + RIGHT_GUTTER);
+    let name = truncate_cols(&filename, fname_budget.max(3));
+    let name_w = display_width(&name);
+    let pad = inner_w
+        .saturating_sub(LEFT_FIXED + name_w + right_w + RIGHT_GUTTER)
+        .max(1);
+
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            icon.to_string(),
+            Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            target,
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(name, Style::default().fg(name_fg)),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(right, right_style),
+        Span::raw("  "),
+    ])
 }
 
 fn draw_help_bar(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
@@ -958,6 +927,8 @@ fn draw_help_overlay(f: &mut Frame<'_>, area: Rect, p: &theme::Palette) {
         Line::from("  Space              toggle selected target"),
         Line::from("  1–9                quick-toggle Nth target"),
         Line::from("  Enter              execute sync (manual)"),
+        Line::from("  /                  filter Activity (focus Activity first)"),
+        Line::from("  click a row        re-copy that remote path to clipboard"),
         Line::from("  a / m              auto / manual mode"),
         Line::from("  c                  cycle clipboard format"),
         Line::from("  t                  cycle theme"),
@@ -1063,18 +1034,6 @@ fn summarize_ssh_error(e: &str) -> String {
     cut
 }
 
-fn truncate_middle(s: &str, max: usize) -> String {
-    if max < 8 || s.chars().count() <= max {
-        return s.to_string();
-    }
-    let half = (max - 1) / 2;
-    let chars: Vec<char> = s.chars().collect();
-    let total = chars.len();
-    let head: String = chars.iter().take(half).collect();
-    let tail: String = chars.iter().skip(total - half).collect();
-    format!("{head}…{tail}")
-}
-
 fn center_line<'a>(width: u16, inner: Vec<Span<'a>>) -> Line<'a> {
     let content_w: usize = inner
         .iter()
@@ -1091,8 +1050,119 @@ fn center_line<'a>(width: u16, inner: Vec<Span<'a>>) -> Line<'a> {
 }
 
 fn unicode_width_str(s: &str) -> usize {
+    display_width(s)
+}
+
+/// Terminal display width (CJK = 2 cols, emoji = 2 cols).
+fn display_width(s: &str) -> usize {
     use unicode_width::UnicodeWidthChar;
     s.chars()
         .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
         .sum()
+}
+
+/// Truncate by display columns with a middle ellipsis so filenames never
+/// overflow a column budget — a char-count-based truncation would be wrong
+/// for CJK since each char takes 2 terminal cols.
+fn truncate_cols(s: &str, max_cols: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    if max_cols == 0 {
+        return String::new();
+    }
+    if display_width(s) <= max_cols {
+        return s.to_string();
+    }
+    if max_cols == 1 {
+        return "…".to_string();
+    }
+    let budget = max_cols - 1; // reserve 1 col for the ellipsis
+    let prefix_budget = budget.div_ceil(2);
+    let suffix_budget = budget - prefix_budget;
+
+    let mut prefix = String::new();
+    let mut pw = 0usize;
+    for c in s.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if pw + cw > prefix_budget {
+            break;
+        }
+        prefix.push(c);
+        pw += cw;
+    }
+    let mut suffix_rev: Vec<char> = Vec::new();
+    let mut sw = 0usize;
+    for c in s.chars().rev() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if sw + cw > suffix_budget {
+            break;
+        }
+        suffix_rev.push(c);
+        sw += cw;
+    }
+    let suffix: String = suffix_rev.into_iter().rev().collect();
+    format!("{prefix}…{suffix}")
+}
+
+/// Pad with spaces (or middle-truncate) so the result is exactly `cols`
+/// display columns wide.
+fn pad_or_trunc(s: &str, cols: usize) -> String {
+    let mut out = if display_width(s) > cols {
+        truncate_cols(s, cols)
+    } else {
+        s.to_string()
+    };
+    let w = display_width(&out);
+    if w < cols {
+        out.push_str(&" ".repeat(cols - w));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_width_counts_cjk_and_emoji_as_two() {
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(display_width("截图"), 4);
+        assert_eq!(display_width("a截b"), 4);
+    }
+
+    #[test]
+    fn truncate_cols_short_circuits_when_fits() {
+        assert_eq!(truncate_cols("hello", 10), "hello");
+        assert_eq!(truncate_cols("", 10), "");
+    }
+
+    #[test]
+    fn truncate_cols_never_overflows_budget() {
+        for s in [
+            "verylongfilenamewithoutanyspaces.png",
+            "截图2026-04-19_11.31.26.png",
+            "FireShot Capture 001 - Polymarket - [gemini.google.com].pdf",
+            "🎉🎉🎉🎉🎉🎉.png",
+        ] {
+            for budget in [5, 10, 20, 40] {
+                let t = truncate_cols(s, budget);
+                assert!(
+                    display_width(&t) <= budget,
+                    "{s:?} trunc to {budget} → {t:?} (width {})",
+                    display_width(&t)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pad_or_trunc_is_exactly_cols_wide() {
+        for (s, cols) in [
+            ("dev", 10usize),
+            ("devjp", 10),
+            ("verylongtargetnamethatoverflows", 10),
+            ("截图", 10),
+        ] {
+            assert_eq!(display_width(&pad_or_trunc(s, cols)), cols);
+        }
+    }
 }

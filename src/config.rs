@@ -331,8 +331,10 @@ mod round_trip_tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
 
-        let mut cfg = Config::default();
-        cfg.default_target = Some("devjp".into());
+        let mut cfg = Config {
+            default_target: Some("devjp".into()),
+            ..Config::default()
+        };
         cfg.targets.push(Target {
             name: "devjp".into(),
             host: "1.2.3.4".into(),

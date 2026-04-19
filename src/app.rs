@@ -64,7 +64,6 @@ pub enum HelpBarAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
-    BrowseHistory,
     AddTargetFromSsh,
     RemoveCurrentTarget,
     ReprobeTargets,
@@ -82,7 +81,6 @@ pub enum MenuAction {
 impl MenuAction {
     pub fn label(self) -> &'static str {
         match self {
-            MenuAction::BrowseHistory => "Browse file history",
             MenuAction::AddTargetFromSsh => "Add target from ~/.ssh/config",
             MenuAction::RemoveCurrentTarget => "Remove selected target",
             MenuAction::ReprobeTargets => "Re-probe all targets",
@@ -100,7 +98,6 @@ impl MenuAction {
 
     pub fn shortcut(self) -> &'static str {
         match self {
-            MenuAction::BrowseHistory => "h",
             MenuAction::AddTargetFromSsh => "+",
             MenuAction::RemoveCurrentTarget => "-",
             MenuAction::ReprobeTargets => "r",
@@ -118,7 +115,6 @@ impl MenuAction {
 
     pub fn all() -> &'static [MenuAction] {
         &[
-            MenuAction::BrowseHistory,
             MenuAction::AddTargetFromSsh,
             MenuAction::RemoveCurrentTarget,
             MenuAction::ReprobeTargets,
@@ -195,12 +191,6 @@ pub struct SshPicker {
     pub cursor: usize,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct HistoryPicker {
-    pub query: String,
-    pub cursor: usize,
-}
-
 pub struct App {
     pub cfg: Config,
     pub mode: SyncMode,
@@ -226,7 +216,9 @@ pub struct App {
     pub menu_cursor: usize,
 
     pub ssh_picker: Option<SshPicker>,
-    pub history_picker: Option<HistoryPicker>,
+    /// None = inactive. Some("") = filter bar visible but no query. Some(q) =
+    /// filtering the activity list by q. Lives with Focus::Progress.
+    pub activity_filter: Option<String>,
     pub history: HistoryStore,
 
     pub update_status: UpdateStatus,
@@ -295,7 +287,7 @@ impl App {
             menu_visible: false,
             menu_cursor: 0,
             ssh_picker: None,
-            history_picker: None,
+            activity_filter: None,
             history: HistoryStore::load().unwrap_or_default(),
             update_status: UpdateStatus::Idle,
             hit_regions: HitRegions::default(),
@@ -471,20 +463,6 @@ impl App {
             self.ssh_picker = None;
             return;
         }
-        if self.history_picker.is_some() {
-            let rows = self.hit_regions.history_rows.clone();
-            for (r, idx) in rows {
-                if rect_contains(r, x, y) {
-                    if let Some(hp) = self.history_picker.as_mut() {
-                        hp.cursor = idx;
-                    }
-                    self.history_copy_selected();
-                    return;
-                }
-            }
-            self.history_picker = None;
-            return;
-        }
         // Menu takes precedence (it's drawn on top of everything else).
         if self.menu_visible {
             for (r, action) in self.hit_regions.menu_rows.clone() {
@@ -585,13 +563,19 @@ impl App {
             }
         }
 
-        // Progress row click → if that transfer completed, re-copy its remote
-        // path to the clipboard (useful when multiple parallel transfers
-        // finish in quick succession).
+        // Activity row click → live transfer rows copy on completion, history
+        // rows re-render the clipboard text for that entry.
         for (r, id) in self.hit_regions.progress_rows.clone() {
             if rect_contains(r, x, y) {
                 self.focus = Focus::Progress;
                 self.recopy_completed(id);
+                return;
+            }
+        }
+        for (r, idx) in self.hit_regions.history_rows.clone() {
+            if rect_contains(r, x, y) {
+                self.focus = Focus::Progress;
+                self.copy_history_by_index(idx);
                 return;
             }
         }
@@ -678,30 +662,6 @@ impl App {
             }
             return;
         }
-        if self.history_picker.is_some() {
-            match key.code {
-                KeyCode::Esc => {
-                    self.history_picker = None;
-                }
-                KeyCode::Up => self.history_move(-1),
-                KeyCode::Down | KeyCode::Tab => self.history_move(1),
-                KeyCode::Enter => self.history_copy_selected(),
-                KeyCode::Backspace => {
-                    if let Some(hp) = self.history_picker.as_mut() {
-                        hp.query.pop();
-                        hp.cursor = 0;
-                    }
-                }
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some(hp) = self.history_picker.as_mut() {
-                        hp.query.push(c);
-                        hp.cursor = 0;
-                    }
-                }
-                _ => {}
-            }
-            return;
-        }
         if self.menu_visible {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
@@ -736,11 +696,36 @@ impl App {
             self.help_visible = false;
             return;
         }
+        // Activity filter input swallows text while active.
+        if self.activity_filter.is_some() && self.focus == Focus::Progress {
+            match key.code {
+                KeyCode::Esc => {
+                    self.activity_filter = None;
+                }
+                KeyCode::Backspace => {
+                    if let Some(q) = self.activity_filter.as_mut() {
+                        q.pop();
+                    }
+                }
+                KeyCode::Enter => {
+                    self.activity_filter = None;
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(q) = self.activity_filter.as_mut() {
+                        q.push(c);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.help_visible = true,
             KeyCode::Char('u') => self.start_update_check(),
-            KeyCode::Char('h') => self.open_history_picker(),
+            KeyCode::Char('/') if self.focus == Focus::Progress => {
+                self.activity_filter = Some(String::new());
+            }
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.menu_visible = true;
                 self.menu_cursor = 0;
@@ -797,7 +782,6 @@ impl App {
 
     fn run_menu_action(&mut self, a: MenuAction) {
         match a {
-            MenuAction::BrowseHistory => self.open_history_picker(),
             MenuAction::AddTargetFromSsh => self.open_ssh_picker(),
             MenuAction::RemoveCurrentTarget => self.remove_current_target(),
             MenuAction::CheckUpdate => self.start_update_check(),
@@ -841,58 +825,34 @@ impl App {
         }
     }
 
-    pub fn open_history_picker(&mut self) {
-        if self.history.entries.is_empty() {
-            self.toast("no history yet — sync a file first");
-            return;
-        }
-        self.history_picker = Some(HistoryPicker::default());
+    /// Filter string used by the Activity panel (lower-cased, trimmed). Empty
+    /// when the user hasn't entered filter mode.
+    pub fn activity_query(&self) -> String {
+        self.activity_filter.clone().unwrap_or_default()
     }
 
-    fn history_move(&mut self, delta: i32) {
-        let matches = self.history.filter(&self.history_picker_query());
-        let n = matches.len();
-        if n == 0 {
-            return;
-        }
-        if let Some(hp) = self.history_picker.as_mut() {
-            let cur = hp.cursor as i32;
-            hp.cursor = ((cur + delta).rem_euclid(n as i32)) as usize;
-        }
-    }
-
-    fn history_picker_query(&self) -> String {
-        self.history_picker
-            .as_ref()
-            .map(|h| h.query.clone())
-            .unwrap_or_default()
-    }
-
-    fn history_copy_selected(&mut self) {
-        let query = self.history_picker_query();
-        let cursor = self.history_picker.as_ref().map(|h| h.cursor).unwrap_or(0);
-        let matches = self.history.filter(&query);
-        let Some(e) = matches.get(cursor).cloned().cloned() else {
+    /// Copy the remote path for the history entry at `idx` in the currently
+    /// filtered view. Called from the Activity row click handler.
+    pub fn copy_history_by_index(&mut self, idx: usize) {
+        let q = self.activity_query();
+        let matches = self.history.filter(&q);
+        let Some(entry) = matches.get(idx).cloned().cloned() else {
             return;
         };
-        self.history_picker = None;
-
-        // Render clipboard via current format. We look the target up from cfg
-        // (if still present), else fall back to storing the raw remote_path.
-        let text = if let Some(t) = self.cfg.target_by_name(&e.target_name) {
+        let text = if let Some(t) = self.cfg.target_by_name(&entry.target_name) {
+            let dir = std::path::Path::new(&entry.remote_path)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
             crate::clipboard::render(
                 t,
-                std::path::Path::new(&e.local_path),
-                std::path::Path::new(&e.remote_path)
-                    .parent()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-                    .as_str(),
+                std::path::Path::new(&entry.local_path),
+                &dir,
                 self.clipboard_format,
                 &self.cfg.clipboard_template,
             )
         } else {
-            e.remote_path.clone()
+            entry.remote_path.clone()
         };
         match crate::clipboard::write(&text) {
             Ok(()) => {
@@ -993,30 +953,49 @@ impl App {
     }
 
     fn rebuild_target_rows(&mut self) {
+        // Preserve status and selection state for existing rows by name so
+        // adding or removing one target doesn't reset probes/selections on
+        // unrelated ones.
+        let prior: std::collections::HashMap<String, (TargetStatus, bool)> = self
+            .target_rows
+            .iter()
+            .map(|r| (r.name.clone(), (r.status.clone(), r.selected)))
+            .collect();
+
         let mut rows: Vec<TargetRow> = self
             .cfg
             .targets
             .iter()
-            .map(|t| TargetRow {
-                name: t.name.clone(),
-                kind: TargetKind::Single,
-                summary: t.display_endpoint(),
-                selected: self
-                    .cfg
-                    .default_target
-                    .as_deref()
-                    .map(|d| d == t.name)
-                    .unwrap_or(false),
-                status: TargetStatus::Unknown,
+            .map(|t| {
+                let (status, selected) = prior.get(&t.name).cloned().unwrap_or_else(|| {
+                    let sel = self
+                        .cfg
+                        .default_target
+                        .as_deref()
+                        .map(|d| d == t.name)
+                        .unwrap_or(false);
+                    (TargetStatus::Unknown, sel)
+                });
+                TargetRow {
+                    name: t.name.clone(),
+                    kind: TargetKind::Single,
+                    summary: t.display_endpoint(),
+                    selected,
+                    status,
+                }
             })
             .collect();
         for g in &self.cfg.groups {
+            let (status, selected) = prior
+                .get(&g.name)
+                .cloned()
+                .unwrap_or((TargetStatus::Unknown, false));
             rows.push(TargetRow {
                 name: g.name.clone(),
                 kind: TargetKind::Group,
                 summary: format!("group → {}", g.targets.join(" + ")),
-                selected: false,
-                status: TargetStatus::Unknown,
+                selected,
+                status,
             });
         }
         self.target_rows = rows;
