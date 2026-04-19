@@ -737,20 +737,48 @@ impl App {
             }
             return;
         }
+        // When focus is the DropZone we do NOT fire any letter shortcut:
+        // some terminals deliver dragged paths as a burst of key events
+        // (not bracketed paste), and letters in the path like "t" or "q"
+        // would otherwise cycle theme or quit. Control keys (Tab, Enter,
+        // Backspace, Delete, arrows, Esc) and ctrl-combinations still work.
+        let in_drop_zone = self.focus == Focus::DropZone;
+
         match key.code {
+            // ---- always-available keys (don't collide with path chars) ----
+            KeyCode::Tab => self.cycle_focus(1),
+            KeyCode::BackTab => self.cycle_focus(-1),
+            KeyCode::Up => self.move_cursor(-1),
+            KeyCode::Down => self.move_cursor(1),
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.menu_visible = true;
+                self.menu_cursor = 0;
+            }
+            KeyCode::Enter => {
+                if self.focus == Focus::Progress {
+                    self.copy_activity_cursor();
+                } else {
+                    self.start_queue_sync();
+                }
+            }
+            KeyCode::Delete | KeyCode::Backspace if in_drop_zone => {
+                if !self.queue.is_empty() && self.queue_cursor < self.queue.len() {
+                    self.queue.remove(self.queue_cursor);
+                    if self.queue_cursor >= self.queue.len() && self.queue_cursor > 0 {
+                        self.queue_cursor -= 1;
+                    }
+                }
+            }
+
+            // ---- letter shortcuts: inactive in DropZone (paste-safe) ----
+            KeyCode::Char(_) if in_drop_zone => {}
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.help_visible = true,
             KeyCode::Char('u') => self.start_update_check(),
             KeyCode::Char('/') if self.focus == Focus::Progress => {
                 self.activity_filter = Some(String::new());
             }
-            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.menu_visible = true;
-                self.menu_cursor = 0;
-            }
             KeyCode::Char('t') => self.cycle_theme(),
-            KeyCode::Tab => self.cycle_focus(1),
-            KeyCode::BackTab => self.cycle_focus(-1),
             KeyCode::Char('a') => {
                 self.mode = SyncMode::Auto;
                 self.toast("mode: auto");
@@ -760,34 +788,16 @@ impl App {
                 self.toast("mode: manual");
             }
             KeyCode::Char('c') => self.cycle_clipboard_format(),
-            KeyCode::Up => self.move_cursor(-1),
-            KeyCode::Down => self.move_cursor(1),
             KeyCode::Char(' ') if self.focus == Focus::Targets => self.toggle_target_cursor(),
-            KeyCode::Char(d @ '1'..='9') if self.focus != Focus::Progress => {
+            // 1–9: quick-toggle Nth target. Only when focus is on the Targets
+            // panel — otherwise digits in a pasted/dragged path would toggle
+            // targets.
+            KeyCode::Char(d @ '1'..='9') if self.focus == Focus::Targets => {
                 let idx = (d as u8 - b'1') as usize;
                 if idx < self.target_rows.len() {
                     self.target_cursor = idx;
                     self.toggle_target_cursor();
                 }
-            }
-            KeyCode::Enter => {
-                if self.focus == Focus::Progress {
-                    self.copy_activity_cursor();
-                } else {
-                    self.start_queue_sync();
-                }
-            }
-            KeyCode::Delete | KeyCode::Backspace if self.focus == Focus::DropZone => {
-                if !self.queue.is_empty() && self.queue_cursor < self.queue.len() {
-                    self.queue.remove(self.queue_cursor);
-                    if self.queue_cursor >= self.queue.len() && self.queue_cursor > 0 {
-                        self.queue_cursor -= 1;
-                    }
-                }
-            }
-            KeyCode::Char('x') if self.focus == Focus::DropZone => {
-                self.queue.clear();
-                self.queue_cursor = 0;
             }
             _ => {}
         }
