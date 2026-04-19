@@ -534,7 +534,7 @@ fn draw_targets(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "  1.  Press Ctrl+P (or click ≡ below)",
+                "  1.  Press Ctrl+P (or click the menu chip below)",
                 Style::default().fg(p.muted),
             )),
             Line::from(Span::styled(
@@ -1004,7 +1004,7 @@ fn draw_help_bar(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palett
         ("Tab", "focus", HelpBarAction::CycleFocus),
         ("Enter", "sync", HelpBarAction::Sync),
         ("u", "update", HelpBarAction::CheckUpdate),
-        ("≡", "menu", HelpBarAction::OpenMenu),
+        ("Ctrl+P", "menu", HelpBarAction::OpenMenu),
         ("?", "help", HelpBarAction::ToggleHelp),
         ("q", "quit", HelpBarAction::Quit),
     ];
