@@ -3059,23 +3059,31 @@ impl App {
                 }
             }
             TunnelEvent::Stderr { name, line } => {
-                // Mirror already done in tunnel.rs. Only surface lines that
-                // plausibly mean something to the user.
-                let noteworthy = line.contains("Warning")
-                    || line.contains("Error")
-                    || line.contains("bind: Address");
-                if noteworthy {
-                    self.tunnel_recent.insert(
-                        0,
-                        RecentTunnelEvent {
-                            tunnel_name: name.clone(),
-                            status_or_msg: trunc(&line, 80),
-                            at: std::time::Instant::now(),
-                            is_error: true,
-                        },
-                    );
-                    self.tunnel_recent.truncate(40);
+                // Surface every non-empty stderr line. Filtering turned out
+                // to hide the exact messages that matter for debugging —
+                // e.g. `bind: Address already in use` when another app owns
+                // the port. Recent is capped below to keep the list bounded.
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    return;
                 }
+                let is_error = trimmed.contains("Error")
+                    || trimmed.contains("error")
+                    || trimmed.contains("Warning")
+                    || trimmed.contains("bind:")
+                    || trimmed.contains("denied")
+                    || trimmed.contains("refused")
+                    || trimmed.contains("failed");
+                self.tunnel_recent.insert(
+                    0,
+                    RecentTunnelEvent {
+                        tunnel_name: name.clone(),
+                        status_or_msg: trunc(trimmed, 120),
+                        at: std::time::Instant::now(),
+                        is_error,
+                    },
+                );
+                self.tunnel_recent.truncate(100);
             }
             TunnelEvent::Stopped { name } => {
                 self.tunnel_handles.remove(&name);
@@ -3096,7 +3104,7 @@ impl App {
                         is_error: false,
                     },
                 );
-                self.tunnel_recent.truncate(40);
+                self.tunnel_recent.truncate(100);
             }
         }
     }

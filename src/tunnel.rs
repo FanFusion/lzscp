@@ -265,6 +265,44 @@ impl Drop for TunnelHandle {
 }
 
 // =============================================================================
+// stderr classification
+// =============================================================================
+
+/// Patterns that indicate "retrying won't help" — bail out instead of
+/// entering the reconnect loop. These are all verbatim substrings that
+/// OpenSSH prints on stderr.
+pub(crate) fn is_fatal_stderr(line: &str) -> bool {
+    const PATTERNS: &[&str] = &[
+        "Address already in use",
+        "cannot listen to port",
+        "Permission denied (publickey",
+        "Permission denied, please try again",
+        "Could not resolve hostname",
+        "Host key verification failed",
+        "No such file or directory",
+    ];
+    PATTERNS.iter().any(|p| line.contains(p))
+}
+
+/// Friendly label for a fatal stderr line. Keeps the local port in the
+/// message when relevant so the user sees *which* port is stuck.
+pub(crate) fn classify_fatal(line: &str, local_port: u16) -> String {
+    if line.contains("Address already in use") || line.contains("cannot listen to port") {
+        format!("local port {local_port} already in use")
+    } else if line.contains("Permission denied") {
+        "ssh auth failed (publickey/password)".into()
+    } else if line.contains("Could not resolve hostname") {
+        "unknown host".into()
+    } else if line.contains("Host key verification failed") {
+        "host key verification failed".into()
+    } else if line.contains("No such file or directory") {
+        "ssh key or config file missing".into()
+    } else {
+        line.to_string()
+    }
+}
+
+// =============================================================================
 // ssh argument construction
 // =============================================================================
 
@@ -350,6 +388,11 @@ async fn tunnel_loop(
     let name = cfg.name.clone();
     let mut attempt: u32 = 1;
     let mut backoff = Duration::from_secs(1);
+    // Set by the stderr drain when it sees a non-retryable error (e.g. local
+    // port already in use). The main loop checks this after each ssh exit
+    // and terminates instead of looping forever against a condition retries
+    // can't fix.
+    let fatal = Arc::new(AtomicBool::new(false));
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -380,14 +423,25 @@ async fn tunnel_loop(
         };
 
         // Drain stderr in a sibling task; each line flows to the UI AND
-        // the transfer log so debugging is available offline.
+        // the transfer log so debugging is available offline. Also watches
+        // for non-retryable patterns (e.g. local bind conflict) and flips
+        // the `fatal` flag so the main loop can stop instead of retrying.
         if let Some(err) = child.stderr.take() {
             let tx_err = tx.clone();
             let name_err = name.clone();
+            let fatal_err = Arc::clone(&fatal);
+            let local_port = cfg.local_port;
             tokio::spawn(async move {
                 let mut reader = BufReader::new(err).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
                     crate::transfer::log_line(&format!("tunnel[{name_err}] {line}"));
+                    if is_fatal_stderr(&line) {
+                        fatal_err.store(true, Ordering::Relaxed);
+                        let _ = tx_err.send(TunnelEvent::StatusChanged {
+                            name: name_err.clone(),
+                            status: TunnelStatus::Failed(classify_fatal(&line, local_port)),
+                        });
+                    }
                     let _ = tx_err.send(TunnelEvent::Stderr {
                         name: name_err.clone(),
                         line,
@@ -419,6 +473,12 @@ async fn tunnel_loop(
         };
 
         if exit_was_intentional || stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Non-retryable error surfaced by the stderr drain — stop looping.
+        // The drain already emitted the Failed status; we just exit.
+        if fatal.load(Ordering::Relaxed) {
             break;
         }
 
@@ -628,5 +688,56 @@ mod tests {
             next_backoff(Duration::from_secs(30)),
             Duration::from_secs(30)
         );
+    }
+
+    // =====================
+    // stderr classifier
+    // =====================
+
+    #[test]
+    fn fatal_detects_bind_address_already_in_use() {
+        assert!(is_fatal_stderr(
+            "bind [127.0.0.1]:57988: Address already in use"
+        ));
+        assert!(is_fatal_stderr(
+            "channel_setup_fwd_listener_tcpip: cannot listen to port: 57988"
+        ));
+    }
+
+    #[test]
+    fn fatal_detects_auth_failure() {
+        assert!(is_fatal_stderr(
+            "Permission denied (publickey,password,keyboard-interactive)."
+        ));
+    }
+
+    #[test]
+    fn fatal_detects_dns_failure() {
+        assert!(is_fatal_stderr(
+            "ssh: Could not resolve hostname nosuchhost.local: nodename nor servname provided"
+        ));
+    }
+
+    #[test]
+    fn fatal_ignores_transient_noise() {
+        assert!(!is_fatal_stderr(
+            "channel 2: open failed: connect failed: Connection refused"
+        ));
+        assert!(!is_fatal_stderr(
+            "Warning: Permanently added 'host' (ED25519)"
+        ));
+    }
+
+    #[test]
+    fn classify_fatal_mentions_local_port_for_bind_conflict() {
+        let msg = classify_fatal("bind [127.0.0.1]:57988: Address already in use", 57988);
+        assert!(msg.contains("57988"));
+        assert!(msg.contains("already in use"));
+    }
+
+    #[test]
+    fn classify_fatal_labels_auth_failure() {
+        let msg = classify_fatal("Permission denied (publickey).", 8888);
+        assert!(msg.contains("auth"));
     }
 }
