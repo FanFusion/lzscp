@@ -161,7 +161,7 @@ fn draw_watch_form(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette)
     };
     let w = 66.min(area.width.saturating_sub(4));
     let opts_h = form.all_target_options.len().clamp(1, 6) as u16;
-    let h = (15 + opts_h).min(area.height.saturating_sub(2));
+    let h = (16 + opts_h).min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect::new(x, y, w, h);
@@ -265,11 +265,36 @@ fn draw_watch_form(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette)
         "[ ] top level only"
     };
     lines.push(Line::from(vec![
-        Span::styled(" Recursive", r_label_style),
+        Span::styled(" Recursive  ", r_label_style),
         Span::raw(" "),
         Span::styled(
             r_value,
             if r_focus {
+                Style::default().fg(p.accent)
+            } else {
+                Style::default().fg(p.fg)
+            },
+        ),
+    ]));
+
+    let oc_focus = form.field == WatchFormField::OnConflict;
+    let oc_label_style = if oc_focus {
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.muted)
+    };
+    let oc_label = match form.on_conflict {
+        crate::target::ConflictAction::Prompt => "prompt (ask me each time)",
+        crate::target::ConflictAction::Overwrite => "overwrite (default replace)",
+        crate::target::ConflictAction::Rename => "rename (auto-suffix -1, -2)",
+        crate::target::ConflictAction::Skip => "skip (ignore and move on)",
+    };
+    lines.push(Line::from(vec![
+        Span::styled(" On conflict", oc_label_style),
+        Span::raw(" "),
+        Span::styled(
+            format!("⟨ {oc_label} ⟩"),
+            if oc_focus {
                 Style::default().fg(p.accent)
             } else {
                 Style::default().fg(p.fg)

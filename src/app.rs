@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use crate::config::Config;
 use crate::history::{HistoryEntry, HistoryStatus, HistoryStore};
 use crate::path_input;
-use crate::target::{CatchupMode, ClipboardFormat, SyncMode, WatchConfig};
+use crate::target::{CatchupMode, ClipboardFormat, ConflictAction, SyncMode, WatchConfig};
 use crate::transfer::{self, Transfer, TransferEvent, TransferState};
 use crate::watch::{self, LockError, PersistedState, WatchEvent, WatchHandle};
 
@@ -287,6 +287,7 @@ pub struct WatchForm {
     pub targets: Vec<String>, // selected target/group names
     pub catchup: CatchupMode,
     pub recursive: bool,
+    pub on_conflict: ConflictAction,
     /// Cursor into `all_target_options` when `field == Targets`.
     pub target_cursor: usize,
     pub all_target_options: Vec<String>,
@@ -316,6 +317,9 @@ pub enum HistoryDeleteTarget {
     One { remote_path: String, label: String },
     /// Clear the entire store.
     All { count: usize },
+    /// Remove a failed live transfer from `App::transfers`. Running /
+    /// pending transfers stay untouched (the user has to wait them out).
+    LiveFailed { id: u64, label: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,6 +330,7 @@ pub enum WatchFormField {
     Targets,
     Catchup,
     Recursive,
+    OnConflict,
 }
 
 impl WatchFormField {
@@ -336,17 +341,19 @@ impl WatchFormField {
             Self::Patterns => Self::Targets,
             Self::Targets => Self::Catchup,
             Self::Catchup => Self::Recursive,
-            Self::Recursive => Self::Name,
+            Self::Recursive => Self::OnConflict,
+            Self::OnConflict => Self::Name,
         }
     }
     fn prev(self) -> Self {
         match self {
-            Self::Name => Self::Recursive,
+            Self::Name => Self::OnConflict,
             Self::Path => Self::Name,
             Self::Patterns => Self::Path,
             Self::Targets => Self::Patterns,
             Self::Catchup => Self::Targets,
             Self::Recursive => Self::Catchup,
+            Self::OnConflict => Self::Recursive,
         }
     }
 }
@@ -602,7 +609,11 @@ impl App {
     pub fn spawn_rsync_version_check(&mut self) {
         let tx = self.app_tx.clone();
         tokio::spawn(async move {
-            let (a, b, _c) = crate::transfer::local_rsync_version().await;
+            let (a, b, c) = crate::transfer::local_rsync_version().await;
+            // Cache the version so run() can conditionally add --iconv.
+            // Without this cache, an old rsync 2.6.9 rejects --iconv with
+            // exit 1 and every transfer breaks on a fresh Mac.
+            crate::transfer::cache_rsync_version((a, b, c));
             if a == 0 {
                 let _ = tx.send(AppEvent::RsyncVersionWarning(
                     "rsync not found locally — install it: brew install rsync".to_string(),
@@ -2174,6 +2185,7 @@ impl App {
             targets: Vec::new(),
             catchup: CatchupMode::Prompt,
             recursive: false,
+            on_conflict: ConflictAction::Rename,
             target_cursor: 0,
             all_target_options: self.all_target_options(),
             error: None,
@@ -2195,6 +2207,7 @@ impl App {
             targets: ui.config.targets.clone(),
             catchup: ui.config.catchup,
             recursive: ui.config.recursive,
+            on_conflict: ui.config.on_conflict,
             target_cursor: 0,
             all_target_options: self.all_target_options(),
             error: None,
@@ -2285,6 +2298,27 @@ impl App {
                     form.recursive = !form.recursive;
                 }
             }
+            WatchFormField::OnConflict => {
+                if matches!(
+                    key.code,
+                    KeyCode::Char(' ') | KeyCode::Right | KeyCode::Char('l')
+                ) {
+                    form.on_conflict = match form.on_conflict {
+                        ConflictAction::Prompt => ConflictAction::Overwrite,
+                        ConflictAction::Overwrite => ConflictAction::Rename,
+                        ConflictAction::Rename => ConflictAction::Skip,
+                        ConflictAction::Skip => ConflictAction::Prompt,
+                    };
+                }
+                if matches!(key.code, KeyCode::Left | KeyCode::Char('h')) {
+                    form.on_conflict = match form.on_conflict {
+                        ConflictAction::Prompt => ConflictAction::Skip,
+                        ConflictAction::Overwrite => ConflictAction::Prompt,
+                        ConflictAction::Rename => ConflictAction::Overwrite,
+                        ConflictAction::Skip => ConflictAction::Rename,
+                    };
+                }
+            }
         }
     }
 
@@ -2349,6 +2383,7 @@ impl App {
             enabled: false,
             debounce_ms: 500,
             recursive: form.recursive,
+            on_conflict: form.on_conflict,
         };
 
         match form.mode {
@@ -2385,8 +2420,30 @@ impl App {
         }
         let cursor = self.activity_cursor.min(refs.len() - 1);
         match &refs[cursor] {
-            ActivityRef::Live(_) => {
-                self.toast("can't delete a live transfer — wait until it finishes");
+            ActivityRef::Live(id) => {
+                // Failed transfers get deleted the same way history rows do —
+                // the user already saw the error, no point blocking cleanup.
+                // Running / pending live transfers still stay untouched.
+                let Some(t) = self.transfers.iter().find(|t| t.id == *id) else {
+                    return;
+                };
+                if t.state != TransferState::Failed {
+                    self.toast("can't delete a live transfer — wait until it finishes");
+                    return;
+                }
+                let label = format!(
+                    "{} → {}",
+                    t.local
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    t.target_name
+                );
+                self.history_delete_confirm = Some(HistoryDeleteTarget::LiveFailed {
+                    id: *id,
+                    label: label.clone(),
+                });
+                self.toast(&format!("delete '{label}'? y / n / Esc"));
             }
             ActivityRef::History(i) => {
                 let matches = self.history.filter(&self.activity_query());
@@ -2436,6 +2493,18 @@ impl App {
                 Ok(_) => self.toast(&format!("cleared {count} history entries")),
                 Err(e) => self.toast(&format!("clear failed: {e}")),
             },
+            HistoryDeleteTarget::LiveFailed { id, label } => {
+                if let Some(pos) = self.transfers.iter().position(|t| t.id == id) {
+                    self.transfers.remove(pos);
+                    // transfer_index is keyed by id; rebuild to keep the
+                    // positions accurate for future completion events.
+                    self.transfer_index.clear();
+                    for (i, t) in self.transfers.iter().enumerate() {
+                        self.transfer_index.insert(t.id, i);
+                    }
+                }
+                self.toast(&format!("deleted failed transfer ({label})"));
+            }
         }
         // Cursor may now point past the end — clamp on next tick via move_activity_cursor.
         self.activity_cursor = 0;
@@ -2535,6 +2604,22 @@ impl App {
         subdir: Option<String>,
         source_watch: Option<String>,
     ) {
+        // Block transfers outright when local rsync is too old or missing —
+        // otherwise every rsync will fail with a cryptic "syntax error" on
+        // --iconv or --info=progress2 and the user can't tell why.
+        match transfer::rsync_status() {
+            transfer::RsyncStatus::Missing => {
+                self.toast("rsync not installed — run: brew install rsync");
+                return;
+            }
+            transfer::RsyncStatus::TooOld(a, b) => {
+                self.toast(&format!(
+                    "local rsync v{a}.{b} too old (need 3.0+) — run: brew install rsync"
+                ));
+                return;
+            }
+            _ => {}
+        }
         // Guard against the macOS screenshot rename race: screenshots land as
         // "name.png" (with a space) and are atomically renamed to the
         // underscore variant a moment later. Without this check the poller's
@@ -2543,9 +2628,30 @@ impl App {
         if !local.exists() {
             return;
         }
-        if !self.cfg.confirm_remote_overwrite {
-            // User opted out of preflight — go straight to rsync. rsync will
-            // silently overwrite if remote exists; pre-0.4.5 behavior.
+        // Look up the conflict policy: per-watch override wins, otherwise
+        // fall back to the Drop-tab default (backward-compat: if the legacy
+        // `confirm_remote_overwrite = false` is set AND drop_on_conflict is
+        // the default Prompt, demote to Overwrite).
+        let policy = match source_watch.as_deref() {
+            Some(name) => self
+                .cfg
+                .watches
+                .iter()
+                .find(|w| w.name == name)
+                .map(|w| w.on_conflict)
+                .unwrap_or(ConflictAction::Rename),
+            None => {
+                if !self.cfg.confirm_remote_overwrite
+                    && self.cfg.drop_on_conflict == ConflictAction::Prompt
+                {
+                    ConflictAction::Overwrite
+                } else {
+                    self.cfg.drop_on_conflict
+                }
+            }
+        };
+        if policy == ConflictAction::Overwrite {
+            // No preflight needed — rsync will overwrite if a file is there.
             self.start_transfer_now(target, local, subdir, source_watch, None);
             return;
         }
@@ -2554,7 +2660,6 @@ impl App {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
         if basename.is_empty() {
-            // Something odd — no basename. Fall back to direct start.
             self.start_transfer_now(target, local, subdir, source_watch, None);
             return;
         }
@@ -2586,23 +2691,58 @@ impl App {
             self.start_transfer_now(r.target, r.local, r.subdir, r.source_watch, None);
             return;
         }
+        // Consult policy again — this is the first moment we actually know
+        // there's a collision, so Rename / Skip decide without user input.
+        let policy = match r.source_watch.as_deref() {
+            Some(name) => self
+                .cfg
+                .watches
+                .iter()
+                .find(|w| w.name == name)
+                .map(|w| w.on_conflict)
+                .unwrap_or(ConflictAction::Rename),
+            None => self.cfg.drop_on_conflict,
+        };
         let suggested_rename = r.suggested_rename.unwrap_or_else(|| {
             r.local
                 .file_name()
                 .map(|s| format!("{}.new", s.to_string_lossy()))
                 .unwrap_or_else(|| "unnamed.new".to_string())
         });
-        self.collision_queue.push_back(PendingCollision {
-            local: r.local,
-            target: r.target,
-            subdir: r.subdir,
-            source_watch: r.source_watch,
-            suggested_rename,
-        });
-        // Ambient toast so the user notices the modal appeared, especially
-        // when triggered by a background watch poller.
-        if self.collision_queue.len() == 1 {
-            self.toast("remote file exists — press o / s / r / Esc");
+        match policy {
+            ConflictAction::Overwrite => {
+                self.start_transfer_now(r.target, r.local, r.subdir, r.source_watch, None);
+            }
+            ConflictAction::Rename => {
+                self.start_transfer_now(
+                    r.target,
+                    r.local,
+                    r.subdir,
+                    r.source_watch,
+                    Some(suggested_rename),
+                );
+            }
+            ConflictAction::Skip => {
+                // Silently skip — still log so the user can see it in the
+                // transfer log if they look.
+                transfer::log_line(&format!(
+                    "collision skip: {} → {} (policy: skip)",
+                    r.local.display(),
+                    r.target.name
+                ));
+            }
+            ConflictAction::Prompt => {
+                self.collision_queue.push_back(PendingCollision {
+                    local: r.local,
+                    target: r.target,
+                    subdir: r.subdir,
+                    source_watch: r.source_watch,
+                    suggested_rename,
+                });
+                if self.collision_queue.len() == 1 {
+                    self.toast("remote file exists — press o / s / r / Esc");
+                }
+            }
         }
     }
 

@@ -115,6 +115,11 @@ async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     cfg: config::Config,
 ) -> Result<()> {
+    // Wire config-level log gates into the global transfer logger BEFORE
+    // any transfer can start, so the very first rsync event honors the
+    // user's transfer_log_enabled / verbose_log preferences.
+    transfer::set_log_enabled(cfg.transfer_log_enabled);
+    transfer::set_verbose_log(cfg.verbose_log);
     let mut app = App::new(cfg);
     app.spawn_rsync_version_check();
     app.spawn_preflight_all();

@@ -1,5 +1,8 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -8,6 +11,98 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use crate::target::Target;
+
+/// Cached local rsync major version — `None` until `init_rsync_version` runs
+/// once at startup, then `Some((major, minor, patch))`.
+static LOCAL_RSYNC_VERSION: OnceLock<(u32, u32, u32)> = OnceLock::new();
+
+/// Runtime-controllable log gate. App wires config.transfer_log_enabled
+/// into this at startup, and the menu / keybind can toggle it live.
+static LOG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static VERBOSE_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_log_enabled(on: bool) {
+    LOG_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn log_enabled() -> bool {
+    LOG_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_verbose_log(on: bool) {
+    VERBOSE_LOG.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn verbose_log() -> bool {
+    VERBOSE_LOG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Path to the per-session transfer log. Created on first write.
+pub fn log_path() -> PathBuf {
+    dirs::config_dir()
+        .map(|d| d.join("lzsync/transfer.log"))
+        .unwrap_or_else(|| PathBuf::from("lzsync-transfer.log"))
+}
+
+/// Append one line to the transfer log. Silently drops on any IO error —
+/// we never want logging to break the main flow.
+pub fn log_line(line: &str) {
+    if !log_enabled() {
+        return;
+    }
+    let p = log_path();
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&p)
+    {
+        let _ = writeln!(f, "{now} {line}");
+    }
+}
+
+pub fn cache_rsync_version(v: (u32, u32, u32)) {
+    let _ = LOCAL_RSYNC_VERSION.set(v);
+}
+
+/// Returns true iff the probe has completed AND rsync is 3.0+. Returns
+/// false both during the brief startup window before the probe finishes
+/// AND when rsync is known-too-old. Callers that need "probe pending"
+/// vs. "known bad" should use `rsync_status` instead.
+fn rsync_supports_iconv() -> bool {
+    match LOCAL_RSYNC_VERSION.get() {
+        Some((major, _, _)) => *major >= 3,
+        None => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RsyncStatus {
+    /// Probe not finished yet — allow transfers; rsync itself will report
+    /// any real problem if the binary truly is broken.
+    Pending,
+    /// rsync binary not found.
+    Missing,
+    /// Installed but version is below the 3.0 minimum we target.
+    TooOld(u32, u32),
+    /// Good to go.
+    Ok,
+}
+
+pub fn rsync_status() -> RsyncStatus {
+    match LOCAL_RSYNC_VERSION.get() {
+        None => RsyncStatus::Pending,
+        Some((0, 0, 0)) => RsyncStatus::Missing,
+        Some((major, minor, _)) if *major < 3 => RsyncStatus::TooOld(*major, *minor),
+        _ => RsyncStatus::Ok,
+    }
+}
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Several fields are reserved for UI features in later versions.
@@ -110,6 +205,12 @@ async fn run(
     subdir: Option<&str>,
     tx: &mpsc::UnboundedSender<TransferEvent>,
 ) -> Result<()> {
+    log_line(&format!(
+        "id={id} target={} local={} subdir={} START",
+        target.name,
+        local.display(),
+        subdir.unwrap_or("")
+    ));
     let _ = tx.send(TransferEvent::Started {
         id,
         target_name: target.name.clone(),
@@ -143,10 +244,11 @@ async fn run(
     cmd.arg("--progress").arg("--partial").arg("-r");
     // macOS stores Unicode filenames as NFD (decomposed) on its native FS.
     // When rsyncing those to a Linux box that expects NFC, certain CJK or
-    // combining sequences fail with rsync exit 23. Convert on the fly.
-    // Requires rsync 3.0+ on the source (Homebrew rsync); macOS's bundled
-    // 2.6.9 lacks --iconv, which is why we warn about old rsync at startup.
-    if cfg!(target_os = "macos") {
+    // combining sequences fail with rsync exit 23. Convert on the fly —
+    // but only if local rsync is 3.x; the macOS-bundled 2.6.9 rejects
+    // --iconv with "syntax or usage error" (exit 1), which is exactly the
+    // failure a user on a fresh Mac with no Homebrew rsync will see.
+    if cfg!(target_os = "macos") && rsync_supports_iconv() {
         cmd.arg("--iconv=utf-8-mac,utf-8");
     }
     cmd.arg("-e")
@@ -179,6 +281,7 @@ async fn run(
                 }
                 s.push_str(&line);
             }
+            log_line(&format!("id={id} stderr {line}"));
             let _ = tx_err.send(TransferEvent::Line { id, line });
         }
     });
@@ -188,11 +291,16 @@ async fn run(
     let _ = stderr_task.await;
 
     if status.success() {
+        log_line(&format!(
+            "id={id} target={} OK {remote_abs_dir}",
+            target.name
+        ));
         let _ = tx.send(TransferEvent::Completed { id, remote_abs_dir });
         Ok(())
     } else {
         let code = status.code().unwrap_or(-1);
         let captured = stderr_buf.lock().expect("stderr lock").clone();
+        log_line(&format!("id={id} EXIT {code}"));
         let detail = if captured.is_empty() {
             explain_rsync_exit(code).to_string()
         } else {
@@ -295,6 +403,12 @@ where
 
 fn emit_line(id: u64, line: &str, tx: &mpsc::UnboundedSender<TransferEvent>) {
     if let Some(p) = parse_progress_line(line) {
+        if verbose_log() {
+            log_line(&format!(
+                "id={id} progress {}% {}B {}",
+                p.percent, p.bytes, p.rate
+            ));
+        }
         let _ = tx.send(TransferEvent::Progress {
             id,
             bytes: p.bytes,
@@ -304,6 +418,9 @@ fn emit_line(id: u64, line: &str, tx: &mpsc::UnboundedSender<TransferEvent>) {
     } else {
         let trimmed = line.trim();
         if !trimmed.is_empty() {
+            if verbose_log() {
+                log_line(&format!("id={id} stdout {trimmed}"));
+            }
             let _ = tx.send(TransferEvent::Line {
                 id,
                 line: trimmed.to_string(),
@@ -544,6 +661,7 @@ async fn run_rename(
                 }
                 s.push_str(&line);
             }
+            log_line(&format!("id={id} stderr {line}"));
             let _ = tx_err.send(TransferEvent::Line { id, line });
         }
     });
@@ -553,11 +671,16 @@ async fn run_rename(
     let _ = stderr_task.await;
 
     if status.success() {
+        log_line(&format!(
+            "id={id} target={} OK {remote_abs_dir}",
+            target.name
+        ));
         let _ = tx.send(TransferEvent::Completed { id, remote_abs_dir });
         Ok(())
     } else {
         let code = status.code().unwrap_or(-1);
         let captured = stderr_buf.lock().expect("stderr lock").clone();
+        log_line(&format!("id={id} EXIT {code}"));
         let detail = if captured.is_empty() {
             explain_rsync_exit(code).to_string()
         } else {

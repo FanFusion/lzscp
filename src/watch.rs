@@ -793,6 +793,7 @@ mod tests {
             enabled: true,
             debounce_ms: 80,
             recursive: false,
+            on_conflict: crate::target::ConflictAction::Rename,
         }
     }
 

@@ -59,6 +59,30 @@ pub struct WatchConfig {
     pub debounce_ms: u64,
     #[serde(default)]
     pub recursive: bool,
+    /// How to handle a remote file that already exists with the same name.
+    /// Watch defaults to `rename` (auto-suffix) so a screenshot workflow
+    /// doesn't stall on a modal for every repeat name; set to `prompt` to
+    /// get the interactive confirm behavior instead.
+    #[serde(default = "default_watch_on_conflict")]
+    pub on_conflict: ConflictAction,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictAction {
+    /// Pop a modal; user picks o/s/r/Esc.
+    #[default]
+    Prompt,
+    /// Skip the ssh preflight and let rsync overwrite silently.
+    Overwrite,
+    /// Auto-suffix the new file with `-N` so both versions survive.
+    Rename,
+    /// Do not transfer; record a `skipped` outcome.
+    Skip,
+}
+
+fn default_watch_on_conflict() -> ConflictAction {
+    ConflictAction::Rename
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]

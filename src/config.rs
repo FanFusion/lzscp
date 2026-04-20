@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::target::{ClipboardFormat, Group, SyncMode, Target, WatchConfig};
+use crate::target::{ClipboardFormat, ConflictAction, Group, SyncMode, Target, WatchConfig};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
@@ -26,8 +26,22 @@ pub struct Config {
     /// When true (default), lzsync checks whether the remote file exists
     /// before rsyncing and pops a confirm modal so the user can overwrite /
     /// skip / rename. Set to false to restore pre-0.4.5 unconditional behavior.
+    /// Kept for backward compatibility — superseded by `drop_on_conflict`.
     #[serde(default = "default_confirm_remote_overwrite")]
     pub confirm_remote_overwrite: bool,
+    /// What to do when a Drop-tab transfer would overwrite a same-named
+    /// file on the remote. Defaults to `prompt` (interactive modal); users
+    /// can set it to `rename` or `overwrite` globally.
+    #[serde(default)]
+    pub drop_on_conflict: ConflictAction,
+    /// When true (default), lzsync appends each transfer's lifecycle +
+    /// stderr to `~/.config/lzsync/transfer.log`. Set false to skip logging.
+    #[serde(default = "default_transfer_log_enabled")]
+    pub transfer_log_enabled: bool,
+    /// When true (default false), also log per-file stdout progress lines.
+    /// Noisy; only turn on for debugging a specific issue.
+    #[serde(default)]
+    pub verbose_log: bool,
     #[serde(skip)]
     pub source: ConfigSource,
     /// Non-persisted notice shown to the user via a toast on first launch
@@ -52,6 +66,10 @@ fn default_confirm_remote_overwrite() -> bool {
     true
 }
 
+fn default_transfer_log_enabled() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -64,6 +82,9 @@ impl Default for Config {
             groups: vec![],
             watches: vec![],
             confirm_remote_overwrite: true,
+            drop_on_conflict: ConflictAction::default(),
+            transfer_log_enabled: true,
+            verbose_log: false,
             source: ConfigSource::Default,
             migration_notice: None,
         }
