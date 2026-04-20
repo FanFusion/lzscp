@@ -162,8 +162,11 @@ fn detect_platform() -> Result<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Ok("linux-x86_64"),
         ("linux", "aarch64") => Ok("linux-aarch64"),
-        ("macos", "x86_64") => Ok("macos-x86_64"),
         ("macos", "aarch64") => Ok("macos-aarch64"),
+        // Intel macOS is no longer shipped as a release artifact — Apple
+        // retired the Intel lineup and our GitHub Actions queue for
+        // macos-13 was blocking the whole release. Users on Intel Macs
+        // can still `cargo install lzsync` or build from source.
         (os, arch) => anyhow::bail!("unsupported platform: {os}/{arch}"),
     }
 }
@@ -199,13 +202,12 @@ mod tests {
 
     #[test]
     fn detect_platform_is_one_of_known() {
-        // Just make sure it returns a known string on the test host.
+        // Intel macOS dropped from releases in 0.5.1 — tests on the CI
+        // runner hosts cover Linux x86_64 and macOS aarch64; `cargo test`
+        // on an Intel Mac dev box will surface a clean error here.
         let p = detect_platform().expect("supported test platform");
         assert!(
-            matches!(
-                p,
-                "linux-x86_64" | "linux-aarch64" | "macos-x86_64" | "macos-aarch64"
-            ),
+            matches!(p, "linux-x86_64" | "linux-aarch64" | "macos-aarch64"),
             "got {p}"
         );
     }
