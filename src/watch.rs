@@ -586,7 +586,7 @@ fn fnv1a_hex(s: &str) -> String {
 }
 
 #[cfg(unix)]
-fn is_pid_alive(pid: u32) -> bool {
+pub(crate) fn is_pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
@@ -602,7 +602,7 @@ fn is_pid_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_pid_alive(_pid: u32) -> bool {
+pub(crate) fn is_pid_alive(_pid: u32) -> bool {
     // On non-Unix we can't cheaply probe. Treat as alive to be safe; the
     // user can manually remove the lock file if needed.
     true

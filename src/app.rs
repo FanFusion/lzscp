@@ -10,8 +10,11 @@ use tokio::sync::mpsc;
 use crate::config::Config;
 use crate::history::{HistoryEntry, HistoryStatus, HistoryStore};
 use crate::path_input;
-use crate::target::{CatchupMode, ClipboardFormat, ConflictAction, SyncMode, WatchConfig};
+use crate::target::{
+    CatchupMode, ClipboardFormat, ConflictAction, SyncMode, TunnelConfig, WatchConfig,
+};
 use crate::transfer::{self, Transfer, TransferEvent, TransferState};
+use crate::tunnel::{self, TunnelEvent, TunnelHandle, TunnelStatus};
 use crate::watch::{self, LockError, PersistedState, WatchEvent, WatchHandle};
 
 #[derive(Debug, Clone)]
@@ -31,6 +34,8 @@ pub enum AppEvent {
     RsyncVersionWarning(String),
     /// Emitted by a running folder-watch poller.
     WatchUpdate(WatchEvent),
+    /// Emitted by a running port-forward tunnel task.
+    TunnelUpdate(TunnelEvent),
     /// Result of a preflight ssh test for an existing remote file. When
     /// `exists == true` and `confirm_remote_overwrite` is on, the app pops
     /// a modal; otherwise the transfer is started immediately.
@@ -53,6 +58,7 @@ pub enum Tab {
     #[default]
     Drop,
     Watch,
+    Ports,
 }
 
 impl Tab {
@@ -60,6 +66,7 @@ impl Tab {
         match self {
             Tab::Drop => "Drop",
             Tab::Watch => "Watch",
+            Tab::Ports => "Ports",
         }
     }
 }
@@ -82,6 +89,8 @@ pub enum Focus {
     Progress,
     /// Watch tab — Folders list.
     Watches,
+    /// Ports tab — Forwards list.
+    Tunnels,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,6 +367,94 @@ impl WatchFormField {
     }
 }
 
+/// Ports tab — one row per configured `[[tunnel]]` block. Mirrors `WatchUi`.
+#[derive(Debug, Clone)]
+pub struct TunnelUi {
+    pub cfg: TunnelConfig,
+    pub status: TunnelStatus,
+    pub last_event_at: Option<std::time::Instant>,
+    pub connected_since: Option<std::time::Instant>,
+}
+
+impl TunnelUi {
+    pub fn from_config(cfg: &TunnelConfig) -> Self {
+        Self {
+            cfg: cfg.clone(),
+            status: TunnelStatus::Off,
+            last_event_at: None,
+            connected_since: None,
+        }
+    }
+}
+
+/// Recent event row for the Ports tab's Recent panel. Mirrors `RecentWatchEvent`.
+#[derive(Debug, Clone)]
+pub struct RecentTunnelEvent {
+    pub tunnel_name: String,
+    pub status_or_msg: String,
+    pub at: std::time::Instant,
+    /// When present, render as a warning/error style; None = neutral.
+    pub is_error: bool,
+}
+
+/// Modal edit form for creating or editing a `[[tunnel]]` block.
+#[derive(Debug, Clone)]
+pub struct TunnelForm {
+    pub mode: TunnelFormMode,
+    pub field: TunnelFormField,
+    pub name: String,
+    pub target_cursor: usize,
+    pub all_target_options: Vec<String>,
+    pub local_port: String,
+    pub remote_host: String,
+    pub remote_port: String,
+    pub bind_address: String,
+    pub autostart: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelFormMode {
+    New,
+    Edit(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelFormField {
+    Name,
+    Target,
+    LocalPort,
+    RemoteHost,
+    RemotePort,
+    BindAddress,
+    Autostart,
+}
+
+impl TunnelFormField {
+    fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Target,
+            Self::Target => Self::LocalPort,
+            Self::LocalPort => Self::RemoteHost,
+            Self::RemoteHost => Self::RemotePort,
+            Self::RemotePort => Self::BindAddress,
+            Self::BindAddress => Self::Autostart,
+            Self::Autostart => Self::Name,
+        }
+    }
+    fn prev(self) -> Self {
+        match self {
+            Self::Name => Self::Autostart,
+            Self::Target => Self::Name,
+            Self::LocalPort => Self::Target,
+            Self::RemoteHost => Self::LocalPort,
+            Self::RemotePort => Self::RemoteHost,
+            Self::BindAddress => Self::RemotePort,
+            Self::Autostart => Self::BindAddress,
+        }
+    }
+}
+
 /// Event emitted by a running poller and recorded for display in the Watch
 /// tab's Recent panel. Kept separate from `history` so watch-specific info
 /// (which watch produced the event) is preserved.
@@ -406,6 +503,16 @@ pub struct App {
     pub watch_tx: mpsc::UnboundedSender<WatchEvent>,
     pub watch_rx: mpsc::UnboundedReceiver<WatchEvent>,
     pub watch_state: PersistedState,
+
+    // Ports tab — port-forward tunnels.
+    pub tunnels: Vec<TunnelUi>,
+    pub tunnel_cursor: usize,
+    pub tunnel_handles: HashMap<String, TunnelHandle>,
+    pub tunnel_recent: Vec<RecentTunnelEvent>,
+    pub tunnel_tx: mpsc::UnboundedSender<TunnelEvent>,
+    pub tunnel_rx: mpsc::UnboundedReceiver<TunnelEvent>,
+    pub tunnel_form: Option<TunnelForm>,
+    pub tunnel_delete_confirm: Option<usize>,
     /// Some(form) when the user is actively editing a watch. When present
     /// the Watch tab's normal key bindings are suppressed in favor of form
     /// input.
@@ -500,11 +607,13 @@ impl App {
         let (tx, rx) = mpsc::unbounded_channel();
         let (app_tx, app_rx) = mpsc::unbounded_channel();
         let (watch_tx, watch_rx) = mpsc::unbounded_channel();
+        let (tunnel_tx, tunnel_rx) = mpsc::unbounded_channel();
         let startup_toast = cfg
             .migration_notice
             .clone()
             .map(|msg| (msg, std::time::Instant::now()));
         let watches: Vec<WatchUi> = cfg.watches.iter().map(WatchUi::from_config).collect();
+        let tunnels: Vec<TunnelUi> = cfg.tunnels.iter().map(TunnelUi::from_config).collect();
         let watch_state = watch::load_state();
 
         Self {
@@ -523,6 +632,14 @@ impl App {
             watch_tx,
             watch_rx,
             watch_state,
+            tunnels,
+            tunnel_cursor: 0,
+            tunnel_handles: HashMap::new(),
+            tunnel_recent: Vec::new(),
+            tunnel_tx,
+            tunnel_rx,
+            tunnel_form: None,
+            tunnel_delete_confirm: None,
             watch_form: None,
             watch_delete_confirm: None,
             history_delete_confirm: None,
@@ -599,6 +716,7 @@ impl App {
             } => self.apply_remote_install_result(&target_name, result),
             AppEvent::RsyncVersionWarning(msg) => self.toast(&msg),
             AppEvent::WatchUpdate(evt) => self.handle_watch_event(evt),
+            AppEvent::TunnelUpdate(evt) => self.handle_tunnel_event(evt),
             AppEvent::CollisionCheckResult(r) => self.handle_collision_result(r),
         }
     }
@@ -1008,6 +1126,11 @@ impl App {
             self.handle_watch_form_key(key);
             return;
         }
+        // Same for the Tunnel form.
+        if self.tunnel_form.is_some() {
+            self.handle_tunnel_form_key(key);
+            return;
+        }
         // Activity filter input swallows text while active.
         if self.activity_filter.is_some() && self.focus == Focus::Progress {
             match key.code {
@@ -1077,6 +1200,7 @@ impl App {
                 }
                 '1' => self.switch_tab(Tab::Drop),
                 '2' => self.switch_tab(Tab::Watch),
+                '3' => self.switch_tab(Tab::Ports),
                 _ => {}
             },
             // Watch tab: Space toggles the current folder, j/k move cursor,
@@ -1093,6 +1217,22 @@ impl App {
             }
             KeyCode::Char('n') | KeyCode::Esc if self.watch_delete_confirm.is_some() => {
                 self.watch_delete_confirm = None;
+            }
+            // Ports tab: Space toggles the current forward, j/k move cursor,
+            // a/e/d manage tunnels.
+            KeyCode::Char(' ') if self.focus == Focus::Tunnels => self.toggle_current_tunnel(),
+            KeyCode::Char('j') if self.focus == Focus::Tunnels => self.move_tunnel_cursor(1),
+            KeyCode::Char('k') if self.focus == Focus::Tunnels => self.move_tunnel_cursor(-1),
+            KeyCode::Char('a') if self.focus == Focus::Tunnels => self.open_new_tunnel_form(),
+            KeyCode::Char('e') if self.focus == Focus::Tunnels => self.open_edit_tunnel_form(),
+            KeyCode::Char('d') if self.focus == Focus::Tunnels => {
+                self.arm_delete_current_tunnel();
+            }
+            KeyCode::Char('y') if self.tunnel_delete_confirm.is_some() => {
+                self.confirm_delete_current_tunnel();
+            }
+            KeyCode::Char('n') | KeyCode::Esc if self.tunnel_delete_confirm.is_some() => {
+                self.tunnel_delete_confirm = None;
             }
             // History row delete: `d` deletes the cursor row, `D` clears all.
             // Confirmation is held in `history_delete_confirm` — y/n/Esc.
@@ -1571,10 +1711,15 @@ impl App {
             self.insert_paste_into_watch_form(raw);
             return;
         }
+        if self.tunnel_form.is_some() {
+            self.insert_paste_into_tunnel_form(raw);
+            return;
+        }
         if self.ssh_picker.is_some()
             || self.menu_visible
             || self.help_visible
             || self.watch_delete_confirm.is_some()
+            || self.tunnel_delete_confirm.is_some()
         {
             return;
         }
@@ -1637,11 +1782,13 @@ impl App {
     }
 
     fn cycle_focus(&mut self, dir: i32) {
-        // Focus cycle is tab-scoped: Drop tab has three panes, Watch tab has
-        // only one (Folders) and Tab / Shift+Tab is a no-op there.
+        // Focus cycle is tab-scoped: Drop tab has three panes, Watch and
+        // Ports each have only one (Folders / Forwards) and Tab / Shift+Tab
+        // is a no-op there.
         let order: &[Focus] = match self.current_tab {
             Tab::Drop => &[Focus::DropZone, Focus::Targets, Focus::Progress],
             Tab::Watch => &[Focus::Watches],
+            Tab::Ports => &[Focus::Tunnels],
         };
         let idx = order.iter().position(|f| *f == self.focus).unwrap_or(0);
         let n = order.len() as i32;
@@ -1669,6 +1816,7 @@ impl App {
             }
             Focus::Progress => self.move_activity_cursor(delta),
             Focus::Watches => self.move_watch_cursor(delta),
+            Focus::Tunnels => self.move_tunnel_cursor(delta),
         }
     }
 
@@ -1987,6 +2135,7 @@ impl App {
         self.focus = match tab {
             Tab::Drop => Focus::DropZone,
             Tab::Watch => Focus::Watches,
+            Tab::Ports => Focus::Tunnels,
         };
     }
 
@@ -2817,6 +2966,452 @@ impl App {
             transfer::spawn(id, target, local, subdir, self.transfer_tx.clone());
         }
     }
+
+    // =====================
+    // Ports tab actions
+    // =====================
+
+    pub fn move_tunnel_cursor(&mut self, delta: i32) {
+        if self.tunnels.is_empty() {
+            self.tunnel_cursor = 0;
+            return;
+        }
+        let len = self.tunnels.len() as i32;
+        let new = (self.tunnel_cursor as i32 + delta).rem_euclid(len);
+        self.tunnel_cursor = new as usize;
+    }
+
+    pub fn toggle_current_tunnel(&mut self) {
+        if self.tunnels.get(self.tunnel_cursor).is_some() {
+            self.toggle_tunnel(self.tunnel_cursor);
+        }
+    }
+
+    /// Start or stop a tunnel at `idx`. If a live handle already exists for
+    /// it, stop the task; otherwise try to acquire the local-port lock and
+    /// spawn the ssh driver.
+    pub fn toggle_tunnel(&mut self, idx: usize) {
+        let Some(ui) = self.tunnels.get(idx) else {
+            return;
+        };
+        let name = ui.cfg.name.clone();
+        let local_port = ui.cfg.local_port;
+        // Already running → stop. The StatusChanged / Stopped events flow
+        // through handle_tunnel_event which clears the handle + status.
+        if let Some(handle) = self.tunnel_handles.remove(&name) {
+            handle.stop();
+            self.toast(&format!("stopping tunnel: {name}"));
+            return;
+        }
+        // Need to start — find the target, acquire the lock, spawn the task.
+        let Some(target) = self
+            .cfg
+            .targets
+            .iter()
+            .find(|t| t.name == ui.cfg.target)
+            .cloned()
+        else {
+            let msg = format!("tunnel '{name}': unknown target '{}'", ui.cfg.target);
+            self.tunnels[idx].status = TunnelStatus::Failed(msg.clone());
+            self.toast(&msg);
+            return;
+        };
+        match tunnel::try_acquire_lock(&name, local_port) {
+            Ok(lock) => {
+                let cfg = ui.cfg.clone();
+                let handle = tunnel::start_tunnel(cfg, target, lock, self.tunnel_tx.clone());
+                self.tunnel_handles.insert(name.clone(), handle);
+                self.tunnels[idx].status = TunnelStatus::Starting;
+                self.tunnels[idx].connected_since = None;
+                self.tunnels[idx].last_event_at = Some(std::time::Instant::now());
+                self.toast(&format!("starting tunnel: {name}"));
+            }
+            Err(tunnel::LockError::Held { pid }) => {
+                self.tunnels[idx].status = TunnelStatus::LockedByOther(pid);
+                self.toast(&format!("port {local_port} locked by PID {pid}"));
+            }
+            Err(tunnel::LockError::Io(msg)) => {
+                self.tunnels[idx].status = TunnelStatus::Failed(msg.clone());
+                self.toast(&format!("tunnel error: {msg}"));
+            }
+        }
+    }
+
+    /// Route a tunnel event to UI state + the transfer log.
+    pub fn handle_tunnel_event(&mut self, evt: TunnelEvent) {
+        match evt {
+            TunnelEvent::StatusChanged { name, status } => {
+                transfer::log_line(&format!("[tunnel:{name}] {status:?}"));
+                if let Some(ui) = self.tunnels.iter_mut().find(|t| t.cfg.name == name) {
+                    let now = std::time::Instant::now();
+                    match &status {
+                        TunnelStatus::Connected => {
+                            if ui.connected_since.is_none() {
+                                ui.connected_since = Some(now);
+                            }
+                        }
+                        _ => {
+                            ui.connected_since = None;
+                        }
+                    }
+                    ui.last_event_at = Some(now);
+                    ui.status = status.clone();
+                }
+            }
+            TunnelEvent::Stderr { name, line } => {
+                // Mirror already done in tunnel.rs. Only surface lines that
+                // plausibly mean something to the user.
+                let noteworthy = line.contains("Warning")
+                    || line.contains("Error")
+                    || line.contains("bind: Address");
+                if noteworthy {
+                    self.tunnel_recent.insert(
+                        0,
+                        RecentTunnelEvent {
+                            tunnel_name: name.clone(),
+                            status_or_msg: trunc(&line, 80),
+                            at: std::time::Instant::now(),
+                            is_error: true,
+                        },
+                    );
+                    self.tunnel_recent.truncate(40);
+                }
+            }
+            TunnelEvent::Stopped { name } => {
+                self.tunnel_handles.remove(&name);
+                if let Some(ui) = self.tunnels.iter_mut().find(|t| t.cfg.name == name) {
+                    // Only downgrade to Off if we haven't already entered a
+                    // terminal failure state during teardown.
+                    if !matches!(ui.status, TunnelStatus::Failed(_)) {
+                        ui.status = TunnelStatus::Off;
+                    }
+                    ui.connected_since = None;
+                }
+                self.tunnel_recent.insert(
+                    0,
+                    RecentTunnelEvent {
+                        tunnel_name: name,
+                        status_or_msg: "stopped".into(),
+                        at: std::time::Instant::now(),
+                        is_error: false,
+                    },
+                );
+                self.tunnel_recent.truncate(40);
+            }
+        }
+    }
+
+    // ---- Tunnel form ----
+
+    pub fn open_new_tunnel_form(&mut self) {
+        if self.cfg.targets.is_empty() {
+            self.toast("add a target first (Ctrl+P → Add target from ~/.ssh/config)");
+            return;
+        }
+        let options: Vec<String> = self.cfg.targets.iter().map(|t| t.name.clone()).collect();
+        self.tunnel_form = Some(TunnelForm {
+            mode: TunnelFormMode::New,
+            field: TunnelFormField::Name,
+            name: String::new(),
+            target_cursor: 0,
+            all_target_options: options,
+            local_port: String::new(),
+            remote_host: "localhost".into(),
+            remote_port: String::new(),
+            bind_address: "127.0.0.1".into(),
+            autostart: false,
+            error: None,
+        });
+    }
+
+    pub fn open_edit_tunnel_form(&mut self) {
+        let Some(ui) = self.tunnels.get(self.tunnel_cursor) else {
+            self.toast("no tunnel to edit");
+            return;
+        };
+        if self.cfg.targets.is_empty() {
+            self.toast("no targets available");
+            return;
+        }
+        let options: Vec<String> = self.cfg.targets.iter().map(|t| t.name.clone()).collect();
+        let target_cursor = options
+            .iter()
+            .position(|n| n == &ui.cfg.target)
+            .unwrap_or(0);
+        let idx = self.tunnel_cursor;
+        let cfg = ui.cfg.clone();
+        self.tunnel_form = Some(TunnelForm {
+            mode: TunnelFormMode::Edit(idx),
+            field: TunnelFormField::Name,
+            name: cfg.name,
+            target_cursor,
+            all_target_options: options,
+            local_port: cfg.local_port.to_string(),
+            remote_host: cfg.remote_host,
+            remote_port: cfg.remote_port.to_string(),
+            bind_address: cfg.bind_address,
+            autostart: cfg.autostart,
+            error: None,
+        });
+    }
+
+    fn handle_tunnel_form_key(&mut self, key: KeyEvent) {
+        let Some(form) = self.tunnel_form.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.tunnel_form = None;
+                return;
+            }
+            KeyCode::Tab => {
+                form.field = form.field.next();
+                return;
+            }
+            KeyCode::BackTab => {
+                form.field = form.field.prev();
+                return;
+            }
+            KeyCode::Enter => {
+                self.save_tunnel_form();
+                return;
+            }
+            _ => {}
+        }
+        match form.field {
+            TunnelFormField::Name => handle_text_key(&mut form.name, key),
+            TunnelFormField::Target => {
+                let opts_len = form.all_target_options.len();
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if opts_len > 0 {
+                            form.target_cursor = (form.target_cursor + opts_len - 1) % opts_len;
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if opts_len > 0 {
+                            form.target_cursor = (form.target_cursor + 1) % opts_len;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            TunnelFormField::LocalPort => handle_numeric_key(&mut form.local_port, key),
+            TunnelFormField::RemoteHost => handle_text_key(&mut form.remote_host, key),
+            TunnelFormField::RemotePort => handle_numeric_key(&mut form.remote_port, key),
+            TunnelFormField::BindAddress => handle_text_key(&mut form.bind_address, key),
+            TunnelFormField::Autostart => {
+                if matches!(
+                    key.code,
+                    KeyCode::Char(' ')
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::Char('h')
+                        | KeyCode::Char('l')
+                ) {
+                    form.autostart = !form.autostart;
+                }
+            }
+        }
+    }
+
+    fn insert_paste_into_tunnel_form(&mut self, raw: &str) {
+        let Some(form) = self.tunnel_form.as_mut() else {
+            return;
+        };
+        let field: &mut String = match form.field {
+            TunnelFormField::Name => &mut form.name,
+            TunnelFormField::LocalPort => &mut form.local_port,
+            TunnelFormField::RemoteHost => &mut form.remote_host,
+            TunnelFormField::RemotePort => &mut form.remote_port,
+            TunnelFormField::BindAddress => &mut form.bind_address,
+            _ => return,
+        };
+        let digits_only = matches!(
+            form.field,
+            TunnelFormField::LocalPort | TunnelFormField::RemotePort
+        );
+        for ch in raw.chars() {
+            if ch == '\n' || ch == '\r' {
+                continue;
+            }
+            if digits_only && !ch.is_ascii_digit() {
+                continue;
+            }
+            field.push(ch);
+        }
+    }
+
+    fn save_tunnel_form(&mut self) {
+        let Some(form) = self.tunnel_form.clone() else {
+            return;
+        };
+        let name = form.name.trim().to_string();
+        if name.is_empty() {
+            if let Some(f) = self.tunnel_form.as_mut() {
+                f.error = Some("name is required".into());
+            }
+            return;
+        }
+        let Some(target) = form.all_target_options.get(form.target_cursor).cloned() else {
+            if let Some(f) = self.tunnel_form.as_mut() {
+                f.error = Some("select a target".into());
+            }
+            return;
+        };
+        if !self.cfg.targets.iter().any(|t| t.name == target) {
+            if let Some(f) = self.tunnel_form.as_mut() {
+                f.error = Some(format!("unknown target '{target}'"));
+            }
+            return;
+        }
+        let local_port: u16 = match form.local_port.trim().parse() {
+            Ok(p) if p > 0 => p,
+            _ => {
+                if let Some(f) = self.tunnel_form.as_mut() {
+                    f.error = Some("local_port must be 1..=65535".into());
+                }
+                return;
+            }
+        };
+        let remote_port: u16 = match form.remote_port.trim().parse() {
+            Ok(p) if p > 0 => p,
+            _ => {
+                if let Some(f) = self.tunnel_form.as_mut() {
+                    f.error = Some("remote_port must be 1..=65535".into());
+                }
+                return;
+            }
+        };
+        let remote_host = if form.remote_host.trim().is_empty() {
+            "localhost".to_string()
+        } else {
+            form.remote_host.trim().to_string()
+        };
+        let bind_address = if form.bind_address.trim().is_empty() {
+            "127.0.0.1".to_string()
+        } else {
+            form.bind_address.trim().to_string()
+        };
+        // Duplicate-name and duplicate-bind checks. Skip the current entry
+        // when editing.
+        let duplicate_name = self.cfg.tunnels.iter().enumerate().any(|(i, t)| {
+            t.name == name && !matches!(form.mode, TunnelFormMode::Edit(e) if e == i)
+        });
+        if duplicate_name {
+            if let Some(f) = self.tunnel_form.as_mut() {
+                f.error = Some(format!("a tunnel named '{name}' already exists"));
+            }
+            return;
+        }
+        let duplicate_bind = self.cfg.tunnels.iter().enumerate().any(|(i, t)| {
+            t.bind_address == bind_address
+                && t.local_port == local_port
+                && !matches!(form.mode, TunnelFormMode::Edit(e) if e == i)
+        });
+        if duplicate_bind {
+            if let Some(f) = self.tunnel_form.as_mut() {
+                f.error = Some(format!(
+                    "another tunnel already binds {bind_address}:{local_port}"
+                ));
+            }
+            return;
+        }
+
+        let new_cfg = TunnelConfig {
+            name: name.clone(),
+            target,
+            local_port,
+            remote_host,
+            remote_port,
+            bind_address,
+            autostart: form.autostart,
+        };
+        match form.mode {
+            TunnelFormMode::New => {
+                self.cfg.tunnels.push(new_cfg.clone());
+                self.tunnels.push(TunnelUi::from_config(&new_cfg));
+                self.tunnel_cursor = self.tunnels.len().saturating_sub(1);
+            }
+            TunnelFormMode::Edit(idx) => {
+                // If the existing tunnel is running, stop it so the new
+                // config takes effect on next toggle.
+                let old_name = self.tunnels[idx].cfg.name.clone();
+                if let Some(handle) = self.tunnel_handles.remove(&old_name) {
+                    handle.stop();
+                }
+                self.cfg.tunnels[idx] = new_cfg.clone();
+                self.tunnels[idx] = TunnelUi::from_config(&new_cfg);
+                self.tunnel_cursor = idx;
+            }
+        }
+        self.tunnel_form = None;
+        self.persist_config();
+        self.toast(&format!("saved tunnel: {name}"));
+    }
+
+    pub fn arm_delete_current_tunnel(&mut self) {
+        if self.tunnels.get(self.tunnel_cursor).is_none() {
+            return;
+        }
+        self.tunnel_delete_confirm = Some(self.tunnel_cursor);
+        let name = &self.tunnels[self.tunnel_cursor].cfg.name;
+        self.toast(&format!(
+            "delete '{name}'? press y to confirm, n / Esc to cancel"
+        ));
+    }
+
+    pub fn confirm_delete_current_tunnel(&mut self) {
+        let Some(idx) = self.tunnel_delete_confirm.take() else {
+            return;
+        };
+        if idx >= self.tunnels.len() {
+            return;
+        }
+        let name = self.tunnels[idx].cfg.name.clone();
+        if let Some(handle) = self.tunnel_handles.remove(&name) {
+            handle.stop();
+        }
+        self.cfg.tunnels.retain(|t| t.name != name);
+        self.tunnels.remove(idx);
+        if self.tunnel_cursor >= self.tunnels.len() && self.tunnel_cursor > 0 {
+            self.tunnel_cursor -= 1;
+        }
+        self.persist_config();
+        self.toast(&format!("deleted tunnel '{name}'"));
+    }
+
+    /// Start every tunnel whose `autostart = true`. Called from main after
+    /// `App::new` so the channel is wired for events.
+    pub fn spawn_autostart_tunnels(&mut self) {
+        let indices: Vec<usize> = self
+            .tunnels
+            .iter()
+            .enumerate()
+            .filter(|(_, ui)| ui.cfg.autostart)
+            .map(|(i, _)| i)
+            .collect();
+        for idx in indices {
+            self.toggle_tunnel(idx);
+        }
+    }
+}
+
+/// Numeric-only text field input. Like `handle_text_key` but silently drops
+/// non-digit chars so the Ports form's port fields stay well-formed.
+fn handle_numeric_key(buf: &mut String, key: KeyEvent) {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return;
+    }
+    match key.code {
+        KeyCode::Backspace => {
+            buf.pop();
+        }
+        KeyCode::Char(c) if c.is_ascii_digit() => {
+            buf.push(c);
+        }
+        _ => {}
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2863,4 +3458,62 @@ fn trunc(s: &str, max: usize) -> String {
         out.push(c);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tunnel_form_field_cycles_forward_and_back() {
+        use TunnelFormField::*;
+        // Forward cycle hits every variant exactly once.
+        let mut f = Name;
+        let order = [
+            Target,
+            LocalPort,
+            RemoteHost,
+            RemotePort,
+            BindAddress,
+            Autostart,
+            Name,
+        ];
+        for expected in order {
+            f = f.next();
+            assert_eq!(f, expected, "forward cycle landed in the wrong field");
+        }
+        // And the reverse cycle is the inverse.
+        let mut f = Name;
+        let rev = [
+            Autostart,
+            BindAddress,
+            RemotePort,
+            RemoteHost,
+            LocalPort,
+            Target,
+            Name,
+        ];
+        for expected in rev {
+            f = f.prev();
+            assert_eq!(f, expected, "reverse cycle landed in the wrong field");
+        }
+    }
+
+    #[test]
+    fn tunnel_ui_from_config_starts_off() {
+        let cfg = TunnelConfig {
+            name: "jupyter".into(),
+            target: "box".into(),
+            local_port: 8888,
+            remote_host: "localhost".into(),
+            remote_port: 8888,
+            bind_address: "127.0.0.1".into(),
+            autostart: false,
+        };
+        let ui = TunnelUi::from_config(&cfg);
+        assert!(matches!(ui.status, TunnelStatus::Off));
+        assert!(ui.connected_since.is_none());
+        assert!(ui.last_event_at.is_none());
+        assert_eq!(ui.cfg.name, "jupyter");
+    }
 }

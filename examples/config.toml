@@ -65,3 +65,20 @@ primary  = "dev"
 # enabled     = false      # try to acquire the watch lock on launch
 # debounce_ms = 500        # wait this long after a new file appears before sending it
 # recursive   = false      # watch subdirectories too
+
+# --- Port forwards (v0.6.0+) -----------------------------------------------
+# A tunnel is an `ssh -L` forward kept alive by lzsync. The `target` field
+# refers to an existing [[target]] above — all SSH connection details
+# (host, user, port, ssh_key) are reused from there. `remote_host` is what
+# the far end sees: default "localhost" means "the service runs on the
+# target itself". Set `remote_host = "internal"` when the target is a
+# bastion jumping to an internal machine.
+
+# [[tunnel]]
+# name         = "jupyter"
+# target       = "dev"        # references [[target]].name above
+# local_port   = 8888
+# remote_host  = "localhost"  # default; viewed from the target machine
+# remote_port  = 8888
+# bind_address = "127.0.0.1"  # default; use "0.0.0.0" to expose on LAN
+# autostart    = false        # connect automatically when lzsync launches

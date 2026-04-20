@@ -8,12 +8,13 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{
     ActivityRef, App, Focus, HelpBarAction, HitRegions, ModalHit, Tab, TargetKind, TargetStatus,
-    UpdateStatus, WatchFormField, WatchUi, WatchUiStatus,
+    TunnelFormField, TunnelUi, UpdateStatus, WatchFormField, WatchUi, WatchUiStatus,
 };
 use crate::history::HistoryEntry;
 use crate::target::CatchupMode;
 use crate::target::SyncMode;
 use crate::transfer::{Transfer, TransferState};
+use crate::tunnel::TunnelStatus;
 
 pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     let palette = theme::palette(&app.cfg.theme);
@@ -43,6 +44,7 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     match app.current_tab {
         Tab::Drop => draw_drop_tab_body(f, body_chunks[2], app, &palette),
         Tab::Watch => draw_watch_tab_body(f, body_chunks[2], app, &palette),
+        Tab::Ports => draw_ports_tab_body(f, body_chunks[2], app, &palette),
     }
 
     draw_toast(f, body_chunks[3], app, &palette);
@@ -63,6 +65,9 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     }
     if app.watch_form.is_some() {
         draw_watch_form(f, size, app, &palette);
+    }
+    if app.tunnel_form.is_some() {
+        draw_tunnel_form(f, size, app, &palette);
     }
     if !app.collision_queue.is_empty() {
         draw_collision_modal(f, size, app, &palette);
@@ -341,7 +346,8 @@ fn text_field_line(label: &str, value: &str, focused: bool, p: &theme::Palette) 
 fn draw_tab_bar(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
     let mut cursor_x: u16 = area.x + 1; // account for leading space
-    for (i, tab) in [Tab::Drop, Tab::Watch].iter().enumerate() {
+    let tabs = [Tab::Drop, Tab::Watch, Tab::Ports];
+    for (i, tab) in tabs.iter().enumerate() {
         let active = app.current_tab == *tab;
         let style = if active {
             Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
@@ -355,18 +361,36 @@ fn draw_tab_bar(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette
             .push((Rect::new(cursor_x, area.y, text_w, 1), *tab));
         cursor_x += text_w;
         spans.push(Span::styled(text, style));
-        if i == 0 {
+        if i + 1 < tabs.len() {
             spans.push(Span::raw(" "));
             cursor_x += 1;
         }
     }
-    // Tail — show watch activity count when not on the Watch tab so the
-    // user notices if the poller is firing in the background.
+    // Tail — on Drop or Watch tab, surface a short status of the other
+    // background activities so the user notices if something's firing in
+    // the background.
     let live_watches = app.watch_handles.len();
-    if live_watches > 0 && app.current_tab != Tab::Watch {
+    let live_forwards = app
+        .tunnels
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.status,
+                TunnelStatus::Connected | TunnelStatus::Reconnecting { .. }
+            )
+        })
+        .count();
+    if app.current_tab != Tab::Watch && live_watches > 0 {
         spans.push(Span::raw("   "));
         spans.push(Span::styled(
             format!("● {live_watches} watching"),
+            Style::default().fg(p.diff_add),
+        ));
+    }
+    if app.current_tab != Tab::Ports && live_forwards > 0 {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(
+            format!("⇄ {live_forwards} forwarding"),
             Style::default().fg(p.diff_add),
         ));
     }
@@ -403,6 +427,319 @@ fn draw_watch_tab_body(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::
         .split(area);
     draw_watches(f, chunks[0], app, p);
     draw_watch_recent(f, chunks[1], app, p);
+}
+
+fn draw_ports_tab_body(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(area);
+    draw_tunnels(f, chunks[0], app, p);
+    draw_tunnel_recent(f, chunks[1], app, p);
+}
+
+fn draw_tunnels(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
+    let focused = app.focus == Focus::Tunnels;
+    let title = if focused { " Forwards " } else { " forwards " };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(border_style(focused, p))
+        .style(Style::default().bg(p.bg).fg(p.fg));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if app.tunnels.is_empty() {
+        let hint = vec![
+            Line::from(Span::styled(
+                "  No forwards configured yet.",
+                Style::default().fg(p.muted),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Press ", Style::default().fg(p.muted)),
+                Span::styled(
+                    "a",
+                    Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    " to add one — name, target, local/remote ports, done.",
+                    Style::default().fg(p.muted),
+                ),
+            ]),
+        ];
+        f.render_widget(Paragraph::new(hint).wrap(Wrap { trim: false }), inner);
+        return;
+    }
+
+    let max = app.tunnels.len().saturating_sub(1);
+    if app.tunnel_cursor > max {
+        app.tunnel_cursor = max;
+    }
+    let cursor = app.tunnel_cursor;
+    let mut lines: Vec<Line<'_>> = app
+        .tunnels
+        .iter()
+        .enumerate()
+        .map(|(i, t)| render_tunnel_row(t, i == cursor && focused, p))
+        .collect();
+    // Trailing "+add forward" hint row (dim, mirrors watch tab's `+add folder`).
+    lines.push(Line::from(Span::styled(
+        "  +add forward".to_string(),
+        Style::default().fg(p.muted).add_modifier(Modifier::DIM),
+    )));
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_tunnel_row<'a>(t: &'a TunnelUi, is_cursor: bool, p: &theme::Palette) -> Line<'a> {
+    let (glyph, glyph_style) = match &t.status {
+        TunnelStatus::Off => ("○", Style::default().fg(p.muted)),
+        TunnelStatus::Starting => ("…", Style::default().fg(p.accent)),
+        TunnelStatus::Connected => (
+            "⇄",
+            Style::default().fg(p.diff_add).add_modifier(Modifier::BOLD),
+        ),
+        TunnelStatus::Reconnecting { .. } => ("↻", Style::default().fg(p.accent)),
+        TunnelStatus::LockedByOther(_) => ("⚠", Style::default().fg(p.diff_del)),
+        TunnelStatus::Failed(_) => ("✗", Style::default().fg(p.diff_del)),
+    };
+    let name = pad_or_trunc(&t.cfg.name, 14);
+    let target = pad_or_trunc(&format!("→ {}", t.cfg.target), 14);
+    let ports = pad_or_trunc(
+        &format!(":{} → :{}", t.cfg.local_port, t.cfg.remote_port),
+        18,
+    );
+    let extra = match &t.status {
+        TunnelStatus::Connected => t
+            .connected_since
+            .map(humanize_elapsed_short)
+            .unwrap_or_default(),
+        TunnelStatus::Reconnecting {
+            attempt,
+            next_retry_in,
+        } => format!("attempt {attempt} · retry in {}s", next_retry_in.as_secs()),
+        TunnelStatus::LockedByOther(pid) => format!("locked PID {pid}"),
+        TunnelStatus::Failed(msg) => truncate_cols(msg, 40),
+        TunnelStatus::Starting => "starting…".to_string(),
+        TunnelStatus::Off => String::new(),
+    };
+    let extra_style = match &t.status {
+        TunnelStatus::Connected => Style::default().fg(p.diff_add),
+        TunnelStatus::Reconnecting { .. } => Style::default().fg(p.accent),
+        TunnelStatus::LockedByOther(_) | TunnelStatus::Failed(_) => Style::default().fg(p.diff_del),
+        TunnelStatus::Starting => Style::default().fg(p.accent),
+        TunnelStatus::Off => Style::default().fg(p.muted),
+    };
+    let base_style = if is_cursor {
+        Style::default()
+            .bg(p.selection)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.fg)
+    };
+    Line::from(vec![
+        Span::styled(" ", base_style),
+        Span::styled(glyph.to_string(), glyph_style.patch(base_style)),
+        Span::styled(" ", base_style),
+        Span::styled(name, base_style),
+        Span::styled(" ", base_style),
+        Span::styled(target, base_style.patch(Style::default().fg(p.accent))),
+        Span::styled(" ", base_style),
+        Span::styled(ports, base_style.patch(Style::default().fg(p.muted))),
+        Span::styled(" ", base_style),
+        Span::styled(extra, base_style.patch(extra_style)),
+    ])
+}
+
+fn draw_tunnel_recent(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
+    let block = Block::default()
+        .title(" recent ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.muted))
+        .style(Style::default().bg(p.bg).fg(p.fg));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if app.tunnel_recent.is_empty() {
+        let msg = Paragraph::new(Line::from(Span::styled(
+            "  (no tunnel activity yet — enable a forward above with Space)",
+            Style::default().fg(p.muted),
+        )));
+        f.render_widget(msg, inner);
+        return;
+    }
+
+    let lines: Vec<Line<'_>> = app
+        .tunnel_recent
+        .iter()
+        .take(inner.height as usize)
+        .map(|e| {
+            let (icon, icon_style) = if e.is_error {
+                ("⚠", Style::default().fg(p.diff_del))
+            } else {
+                ("·", Style::default().fg(p.muted))
+            };
+            let ago = humanize_elapsed(e.at);
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(icon.to_string(), icon_style),
+                Span::raw(" "),
+                Span::styled(
+                    pad_or_trunc(&e.tunnel_name, 14),
+                    Style::default().fg(p.accent),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    truncate_cols(&e.status_or_msg, 60),
+                    Style::default().fg(p.fg),
+                ),
+                Span::raw("  "),
+                Span::styled(ago, Style::default().fg(p.muted)),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Compact humanize (no "ago" suffix) used in the Forwards list's
+/// `connected_since` column: "2h", "5m", "30s".
+fn humanize_elapsed_short(t: std::time::Instant) -> String {
+    let secs = t.elapsed().as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
+}
+
+fn draw_tunnel_form(f: &mut Frame<'_>, area: Rect, app: &App, p: &theme::Palette) {
+    let Some(form) = app.tunnel_form.as_ref() else {
+        return;
+    };
+    let w = 60.min(area.width.saturating_sub(4));
+    let opts_h = form.all_target_options.len().clamp(1, 6) as u16;
+    let h = (14 + opts_h).min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+    f.render_widget(Clear, rect);
+
+    let title = match form.mode {
+        crate::app::TunnelFormMode::New => " Add forward ",
+        crate::app::TunnelFormMode::Edit(_) => " Edit forward ",
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.accent))
+        .style(Style::default().bg(p.bg).fg(p.fg));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(text_field_line(
+        "Name        ",
+        &form.name,
+        form.field == TunnelFormField::Name,
+        p,
+    ));
+
+    // Target selector.
+    let t_focus = form.field == TunnelFormField::Target;
+    let t_label_style = if t_focus {
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.muted)
+    };
+    lines.push(Line::from(Span::styled(
+        " Target      (↑/↓ cycle)",
+        t_label_style,
+    )));
+    for (i, name) in form.all_target_options.iter().enumerate() {
+        let on_cursor = t_focus && form.target_cursor == i;
+        let glyph = if i == form.target_cursor {
+            "●"
+        } else {
+            "○"
+        };
+        let style = if on_cursor {
+            Style::default()
+                .bg(p.selection)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.fg)
+        };
+        lines.push(Line::from(vec![
+            Span::raw("   "),
+            Span::styled(format!("{glyph} {name}"), style),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(text_field_line(
+        "Local port  ",
+        &form.local_port,
+        form.field == TunnelFormField::LocalPort,
+        p,
+    ));
+    lines.push(text_field_line(
+        "Remote host ",
+        &form.remote_host,
+        form.field == TunnelFormField::RemoteHost,
+        p,
+    ));
+    lines.push(text_field_line(
+        "Remote port ",
+        &form.remote_port,
+        form.field == TunnelFormField::RemotePort,
+        p,
+    ));
+    lines.push(text_field_line(
+        "Bind address",
+        &form.bind_address,
+        form.field == TunnelFormField::BindAddress,
+        p,
+    ));
+
+    let a_focus = form.field == TunnelFormField::Autostart;
+    let a_label_style = if a_focus {
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.muted)
+    };
+    let a_value = if form.autostart {
+        "[✓] start this forward on launch"
+    } else {
+        "[ ] off — toggle manually from the Ports tab"
+    };
+    lines.push(Line::from(vec![
+        Span::styled(" Autostart  ", a_label_style),
+        Span::raw(" "),
+        Span::styled(
+            a_value,
+            if a_focus {
+                Style::default().fg(p.accent)
+            } else {
+                Style::default().fg(p.fg)
+            },
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    if let Some(err) = &form.error {
+        lines.push(Line::from(Span::styled(
+            format!(" ⚠ {err}"),
+            Style::default().fg(p.diff_del),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        " Tab next · Shift+Tab prev · Enter save · Esc cancel",
+        Style::default().fg(p.muted),
+    )));
+
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 fn draw_watches(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palette) {
@@ -1571,6 +1908,14 @@ fn draw_help_bar(f: &mut Frame<'_>, area: Rect, app: &mut App, p: &theme::Palett
             ("e", "edit", HelpBarAction::OpenMenu),
             ("Space", "on/off", HelpBarAction::ToggleSelection),
             ("r", "sync now", HelpBarAction::Sync),
+            ("d", "delete", HelpBarAction::OpenMenu),
+            ("^H", "help", HelpBarAction::ToggleHelp),
+            ("^Q", "quit", HelpBarAction::Quit),
+        ],
+        Tab::Ports => vec![
+            ("a", "add", HelpBarAction::OpenMenu),
+            ("e", "edit", HelpBarAction::OpenMenu),
+            ("Space", "on/off", HelpBarAction::ToggleSelection),
             ("d", "delete", HelpBarAction::OpenMenu),
             ("^H", "help", HelpBarAction::ToggleHelp),
             ("^Q", "quit", HelpBarAction::Quit),

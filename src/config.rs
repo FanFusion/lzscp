@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::target::{ClipboardFormat, ConflictAction, Group, SyncMode, Target, WatchConfig};
+use crate::target::{
+    ClipboardFormat, ConflictAction, Group, SyncMode, Target, TunnelConfig, WatchConfig,
+};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
@@ -23,6 +25,8 @@ pub struct Config {
     pub groups: Vec<Group>,
     #[serde(default, rename = "watch")]
     pub watches: Vec<WatchConfig>,
+    #[serde(default, rename = "tunnel")]
+    pub tunnels: Vec<TunnelConfig>,
     /// When true (default), lzsync checks whether the remote file exists
     /// before rsyncing and pops a confirm modal so the user can overwrite /
     /// skip / rename. Set to false to restore pre-0.4.5 unconditional behavior.
@@ -81,6 +85,7 @@ impl Default for Config {
             targets: vec![],
             groups: vec![],
             watches: vec![],
+            tunnels: vec![],
             confirm_remote_overwrite: true,
             drop_on_conflict: ConflictAction::default(),
             transfer_log_enabled: true,
@@ -242,6 +247,40 @@ fn validate(cfg: &Config) -> Result<()> {
                 tn
             );
         }
+    }
+    let mut tunnel_names = HashSet::new();
+    let mut tunnel_binds: HashSet<(String, u16)> = HashSet::new();
+    for t in &cfg.tunnels {
+        anyhow::ensure!(!t.name.is_empty(), "tunnel name must not be empty");
+        anyhow::ensure!(
+            tunnel_names.insert(t.name.clone()),
+            "duplicate tunnel name: {}",
+            t.name
+        );
+        anyhow::ensure!(
+            cfg.targets.iter().any(|target| target.name == t.target),
+            "tunnel '{}' references unknown target '{}'",
+            t.name,
+            t.target
+        );
+        anyhow::ensure!(
+            t.local_port > 0,
+            "tunnel '{}' local_port must be 1..=65535",
+            t.name
+        );
+        anyhow::ensure!(
+            t.remote_port > 0,
+            "tunnel '{}' remote_port must be 1..=65535",
+            t.name
+        );
+        let bind_key = (t.bind_address.clone(), t.local_port);
+        anyhow::ensure!(
+            tunnel_binds.insert(bind_key),
+            "duplicate tunnel bind {}:{} (tunnel '{}')",
+            t.bind_address,
+            t.local_port,
+            t.name
+        );
     }
     Ok(())
 }
@@ -411,6 +450,104 @@ remote_dir = "/tmp"
 "#,
         );
         assert!(parse_from(f.path(), true).is_err());
+    }
+
+    #[test]
+    fn tunnel_unknown_target_fails_validation() {
+        let f = write_tmp(
+            r#"
+[[target]]
+name = "dev"
+host = "dev.example.com"
+remote_dir = "/tmp"
+
+[[tunnel]]
+name = "jupyter"
+target = "missing"
+local_port = 8888
+remote_port = 8888
+"#,
+        );
+        let err = parse_from(f.path(), true).unwrap_err().to_string();
+        assert!(err.contains("unknown target"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn duplicate_tunnel_name_fails() {
+        let f = write_tmp(
+            r#"
+[[target]]
+name = "dev"
+host = "dev.example.com"
+remote_dir = "/tmp"
+
+[[tunnel]]
+name = "jupyter"
+target = "dev"
+local_port = 8888
+remote_port = 8888
+
+[[tunnel]]
+name = "jupyter"
+target = "dev"
+local_port = 8889
+remote_port = 8889
+"#,
+        );
+        let err = parse_from(f.path(), true).unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate tunnel name"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn zero_local_port_fails() {
+        let f = write_tmp(
+            r#"
+[[target]]
+name = "dev"
+host = "dev.example.com"
+remote_dir = "/tmp"
+
+[[tunnel]]
+name = "jupyter"
+target = "dev"
+local_port = 0
+remote_port = 8888
+"#,
+        );
+        let err = parse_from(f.path(), true).unwrap_err().to_string();
+        assert!(err.contains("local_port"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn duplicate_local_port_same_bind_fails() {
+        let f = write_tmp(
+            r#"
+[[target]]
+name = "dev"
+host = "dev.example.com"
+remote_dir = "/tmp"
+
+[[tunnel]]
+name = "a"
+target = "dev"
+local_port = 8888
+remote_port = 8888
+
+[[tunnel]]
+name = "b"
+target = "dev"
+local_port = 8888
+remote_port = 9999
+"#,
+        );
+        let err = parse_from(f.path(), true).unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate tunnel bind"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

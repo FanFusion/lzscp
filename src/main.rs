@@ -6,6 +6,7 @@ mod path_input;
 mod ssh_config;
 mod target;
 mod transfer;
+mod tunnel;
 mod ui;
 mod update;
 mod watch;
@@ -123,6 +124,7 @@ async fn run_app(
     let mut app = App::new(cfg);
     app.spawn_rsync_version_check();
     app.spawn_preflight_all();
+    app.spawn_autostart_tunnels();
     let mut events = EventStream::new();
     let mut tick = interval(Duration::from_millis(100));
 
@@ -147,9 +149,14 @@ async fn run_app(
             Some(watch_evt) = app.watch_rx.recv() => {
                 app.handle_event(AppEvent::WatchUpdate(watch_evt));
             }
+            Some(tunnel_evt) = app.tunnel_rx.recv() => {
+                app.handle_event(AppEvent::TunnelUpdate(tunnel_evt));
+            }
         }
     }
 
     app.persist_watch_state();
+    // Drop tunnel handles → stop flag set → ssh children killed via kill_on_drop.
+    app.tunnel_handles.clear();
     Ok(())
 }

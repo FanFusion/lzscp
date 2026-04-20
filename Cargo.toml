@@ -1,8 +1,8 @@
 [package]
 name = "lzsync"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
-description = "Lazy Sync — a local TUI for drag-drop & folder-watch file sync to SSH hosts with auto clipboard path return"
+description = "Lazy Sync — a local TUI for drag-drop & folder-watch file sync, plus SSH port forwarding, to remote hosts"
 readme = "README.md"
 license = "MIT"
 keywords = ["tui", "terminal", "sync", "rsync", "ssh"]

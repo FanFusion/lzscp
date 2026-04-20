@@ -112,6 +112,32 @@ fn default_debounce_ms() -> u64 {
     500
 }
 
+/// One port-forward tunnel (ssh `-L`). Refers to an existing `[[target]]` by
+/// name so we reuse all the SSH connection details (host, user, key, port)
+/// rather than repeating them. Multi-instance safety for a given local port
+/// is enforced via `crate::tunnel::LockHandle`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TunnelConfig {
+    pub name: String,
+    pub target: String,
+    pub local_port: u16,
+    #[serde(default = "default_tunnel_remote_host")]
+    pub remote_host: String,
+    pub remote_port: u16,
+    #[serde(default = "default_tunnel_bind_address")]
+    pub bind_address: String,
+    #[serde(default)]
+    pub autostart: bool,
+}
+
+fn default_tunnel_remote_host() -> String {
+    "localhost".into()
+}
+
+fn default_tunnel_bind_address() -> String {
+    "127.0.0.1".into()
+}
+
 impl Target {
     #[allow(dead_code)]
     pub fn user_str(&self) -> &str {
