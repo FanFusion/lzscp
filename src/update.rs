@@ -42,9 +42,10 @@ fn parse_semver(s: &str) -> (u32, u32, u32) {
     (a, b, c)
 }
 
-/// Download the release binary for `version` and install to both
-/// `~/.cargo/bin/lzsync` and `~/.local/bin/lzsync`. Returns the list of paths
-/// that were actually written.
+/// Download the release tarball for `version` and install both `lzsync`
+/// and the bundled `lzsync-rsync` to `~/.cargo/bin/` and `~/.local/bin/`.
+/// Returns the list of `lzsync` binary paths written (rsync paths omitted
+/// for readability in the UI toast).
 ///
 /// Safe to run while the caller is still executing the old binary: we write
 /// to a `.new` temp file, remove the old inode, then rename. On Unix the
@@ -52,13 +53,14 @@ fn parse_semver(s: &str) -> (u32, u32, u32) {
 pub async fn download_and_install(version: &str) -> Result<Vec<PathBuf>> {
     let ver = version.trim().trim_start_matches('v').to_string();
     let platform = detect_platform()?;
+    let artifact = format!("lzsync-{platform}");
     let url =
-        format!("https://github.com/FanFusion/lzsync/releases/download/v{ver}/lzsync-{platform}");
+        format!("https://github.com/FanFusion/lzsync/releases/download/v{ver}/{artifact}.tar.gz");
     let url_for_thread = url.clone();
 
     let bytes: Vec<u8> = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
         let resp = ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(std::time::Duration::from_secs(180))
             .build()
             .get(&url_for_thread)
             .call()
@@ -75,37 +77,85 @@ pub async fn download_and_install(version: &str) -> Result<Vec<PathBuf>> {
     .await
     .context("join error")??;
 
+    // Extract the two binaries we care about out of the gzipped tar. We use
+    // tar via stdin instead of pulling in `tar` + `flate2` crates — every
+    // Unix has tar, it keeps the binary slim, and the input is trusted
+    // (signed by the GitHub Actions release).
+    let extract_dir = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+        let dir = std::env::temp_dir().join(format!("lzsync-update-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {dir:?}"))?;
+        let mut child = std::process::Command::new("tar")
+            .arg("-xzf")
+            .arg("-")
+            .arg("-C")
+            .arg(&dir)
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("spawn tar")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin.write_all(&bytes).context("write tar stdin")?;
+        }
+        let out = child.wait_with_output().context("wait tar")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "tar extract failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(dir)
+    })
+    .await
+    .context("join error")??;
+
+    let nested = extract_dir.join(&artifact);
+    let src_lzsync = nested.join("lzsync");
+    let src_rsync = nested.join("lzsync-rsync");
+    if !src_lzsync.is_file() {
+        anyhow::bail!("{src_lzsync:?} missing from release tarball");
+    }
+
     let home = dirs::home_dir().context("HOME not set")?;
-    let targets = [
-        home.join(".cargo/bin/lzsync"),
-        home.join(".local/bin/lzsync"),
-    ];
+    let targets = [home.join(".cargo/bin"), home.join(".local/bin")];
 
     let mut installed = Vec::new();
-    for dst in &targets {
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent).with_context(|| format!("mkdir {parent:?}"))?;
+    for dir in &targets {
+        std::fs::create_dir_all(dir).with_context(|| format!("mkdir {dir:?}"))?;
+        let dst_lzsync = dir.join("lzsync");
+        atomic_install(&src_lzsync, &dst_lzsync)?;
+        if src_rsync.is_file() {
+            let dst_rsync = dir.join("lzsync-rsync");
+            atomic_install(&src_rsync, &dst_rsync)?;
         }
-        let tmp = dst.with_extension("new");
-        std::fs::write(&tmp, &bytes).with_context(|| format!("write {tmp:?}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
-                .with_context(|| format!("chmod {tmp:?}"))?;
-        }
-        // Remove the old file first — on Linux you can't overwrite a running
-        // binary ("text file busy"), but rename-over works because the kernel
-        // keeps the running inode alive.
-        let _ = std::fs::remove_file(dst);
-        std::fs::rename(&tmp, dst).with_context(|| format!("rename -> {dst:?}"))?;
-        installed.push(dst.clone());
+        installed.push(dst_lzsync);
     }
+
+    // Best-effort cleanup of the extracted tree so repeated updates don't
+    // pile up temp dirs; ignore errors.
+    let _ = std::fs::remove_dir_all(&extract_dir);
 
     if installed.is_empty() {
         anyhow::bail!("no install locations were writable");
     }
     Ok(installed)
+}
+
+/// Safe replace: write to `<dst>.new`, remove the old inode (so the
+/// currently-running binary keeps its own file open), then rename.
+fn atomic_install(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    let tmp = dst.with_extension("new");
+    let payload = std::fs::read(src).with_context(|| format!("read {src:?}"))?;
+    std::fs::write(&tmp, &payload).with_context(|| format!("write {tmp:?}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("chmod {tmp:?}"))?;
+    }
+    let _ = std::fs::remove_file(dst);
+    std::fs::rename(&tmp, dst).with_context(|| format!("rename -> {dst:?}"))?;
+    Ok(())
 }
 
 fn detect_platform() -> Result<&'static str> {

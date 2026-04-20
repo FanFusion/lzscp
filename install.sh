@@ -6,7 +6,11 @@
 #
 # Env overrides:
 #   INSTALL_DIR  destination directory (default: $HOME/.local/bin)
-#   VERSION      specific version tag, e.g. VERSION=v0.4.0 (default: latest)
+#   VERSION      specific version tag, e.g. VERSION=v0.5.0 (default: latest)
+#
+# v0.5.0+: release tarballs now ship a bundled `rsync` alongside `lzsync`,
+# installed as `lzsync-rsync` so it doesn't shadow the system rsync. lzsync
+# will automatically prefer the bundled binary when it's a sibling on disk.
 
 set -euo pipefail
 
@@ -45,31 +49,32 @@ echo "Platform: ${os}/${arch} -> ${artifact}"
 # --- Pick download URL ------------------------------------------------------
 
 if [ "$VERSION" = "latest" ]; then
-    url="https://github.com/${REPO}/releases/latest/download/${artifact}"
+    url="https://github.com/${REPO}/releases/latest/download/${artifact}.tar.gz"
 else
-    url="https://github.com/${REPO}/releases/download/${VERSION}/${artifact}"
+    url="https://github.com/${REPO}/releases/download/${VERSION}/${artifact}.tar.gz"
 fi
 
 echo "Source:   $url"
-echo "Install:  $INSTALL_DIR/lzsync"
+echo "Install:  $INSTALL_DIR/lzsync   +   $INSTALL_DIR/lzsync-rsync"
 echo
 
 # --- Prep destination -------------------------------------------------------
 
 mkdir -p "$INSTALL_DIR"
 
-# --- Download --------------------------------------------------------------
+# --- Download and extract --------------------------------------------------
 
-tmp=$(mktemp -t lzsync.XXXXXX)
-trap 'rm -f "$tmp"' EXIT
+tmpdir=$(mktemp -d -t lzsync.XXXXXX)
+trap 'rm -rf "$tmpdir"' EXIT
+archive="$tmpdir/pkg.tar.gz"
 
 if command -v curl >/dev/null 2>&1; then
-    if ! curl -fL --progress-bar -o "$tmp" "$url"; then
+    if ! curl -fL --progress-bar -o "$archive" "$url"; then
         red "Download failed: $url"
         exit 1
     fi
 elif command -v wget >/dev/null 2>&1; then
-    if ! wget -q --show-progress -O "$tmp" "$url"; then
+    if ! wget -q --show-progress -O "$archive" "$url"; then
         red "Download failed: $url"
         exit 1
     fi
@@ -78,19 +83,47 @@ else
     exit 1
 fi
 
+if ! tar -xzf "$archive" -C "$tmpdir"; then
+    red "Extract failed from $archive"
+    exit 1
+fi
+
+# Older releases shipped a raw binary at the artifact name (no tarball).
+# Handle both layouts so an INSTALL_DIR wired to a pre-0.5.0 VERSION still
+# works.
+extracted_dir="$tmpdir/$artifact"
+if [ -d "$extracted_dir" ]; then
+    src_lzsync="$extracted_dir/lzsync"
+    src_rsync="$extracted_dir/lzsync-rsync"
+else
+    red "Unexpected archive layout; looked for $extracted_dir"
+    exit 1
+fi
+
 # --- Install ----------------------------------------------------------------
 
-install -m 755 "$tmp" "$INSTALL_DIR/lzsync"
+install -m 755 "$src_lzsync" "$INSTALL_DIR/lzsync"
+if [ -f "$src_rsync" ]; then
+    install -m 755 "$src_rsync" "$INSTALL_DIR/lzsync-rsync"
+fi
+
 installed_version=$("$INSTALL_DIR/lzsync" --version 2>/dev/null || echo "lzsync")
 green "Installed $installed_version -> $INSTALL_DIR/lzsync"
+if [ -f "$INSTALL_DIR/lzsync-rsync" ]; then
+    rsync_ver=$("$INSTALL_DIR/lzsync-rsync" --version 2>/dev/null | head -n 1 || echo "lzsync-rsync")
+    green "Bundled $rsync_ver -> $INSTALL_DIR/lzsync-rsync"
+fi
 
 # --- macOS gatekeeper hint --------------------------------------------------
 
 if [ "$os" = "macos" ]; then
-    if xattr "$INSTALL_DIR/lzsync" 2>/dev/null | grep -q com.apple.quarantine; then
-        yellow "macOS marked the binary as quarantined. Removing…"
-        xattr -d com.apple.quarantine "$INSTALL_DIR/lzsync" || true
-    fi
+    for bin in "$INSTALL_DIR/lzsync" "$INSTALL_DIR/lzsync-rsync"; do
+        [ -f "$bin" ] || continue
+        if xattr "$bin" 2>/dev/null | grep -q com.apple.quarantine; then
+            yellow "macOS marked $bin as quarantined. Removing…"
+            xattr -d com.apple.quarantine "$bin" || true
+        fi
+    done
 fi
 
 # --- PATH sanity check ------------------------------------------------------

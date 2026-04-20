@@ -104,6 +104,36 @@ pub fn rsync_status() -> RsyncStatus {
     }
 }
 
+/// Pick the rsync binary lzsync should invoke. Release tarballs ship a
+/// prebuilt rsync as `lzsync-rsync` next to the `lzsync` binary; when that
+/// file exists we prefer it over whatever the user has on `$PATH`, so every
+/// install gets the same rsync 3.x without the user thinking about it.
+/// If no bundled copy is present (e.g. `cargo install` builds), fall back
+/// to the system `rsync` by name so `Command` performs a PATH lookup.
+///
+/// The bundled binary is named `lzsync-rsync` (not `rsync`) so placing it
+/// on the user's PATH does not shadow their system rsync for other tools.
+pub fn rsync_command() -> String {
+    // Sibling of the currently-running lzsync binary.
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let candidate = dir.join("lzsync-rsync");
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    // Fallback: ~/.local/share/lzsync/lzsync-rsync (older bundled install
+    // layout, kept for forward compatibility if we change the layout).
+    if let Some(home) = dirs::home_dir() {
+        let candidate = home.join(".local/share/lzsync/lzsync-rsync");
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    "rsync".to_string()
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Several fields are reserved for UI features in later versions.
 pub enum TransferEvent {
@@ -234,7 +264,7 @@ async fn run(
     // Keep rsync non-interactive.
     ssh_opt.push_str(" -o BatchMode=no -o StrictHostKeyChecking=accept-new");
 
-    let mut cmd = Command::new("rsync");
+    let mut cmd = Command::new(rsync_command());
     // --progress works from rsync 2.6+ (macOS default 2.6.9) and emits
     // per-file progress lines. Newer versions also accept it.
     // --partial lets failed transfers resume from where they stopped.
@@ -343,7 +373,11 @@ fn explain_rsync_exit(code: i32) -> &'static str {
 /// Returns (0, 0, 0) if detection fails. Used at startup to warn about
 /// macOS's ancient 2.6.9 which lacks --info=progress2 and many other flags.
 pub async fn local_rsync_version() -> (u32, u32, u32) {
-    let out = match Command::new("rsync").arg("--version").output().await {
+    let out = match Command::new(rsync_command())
+        .arg("--version")
+        .output()
+        .await
+    {
         Ok(o) => o,
         Err(_) => return (0, 0, 0),
     };
@@ -627,7 +661,7 @@ async fn run_rename(
     }
     ssh_opt.push_str(" -o BatchMode=no -o StrictHostKeyChecking=accept-new");
 
-    let mut cmd = Command::new("rsync");
+    let mut cmd = Command::new(rsync_command());
     cmd.arg("--progress")
         .arg("--partial")
         .arg("-r")
